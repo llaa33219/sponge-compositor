@@ -1,0 +1,4 @@
+# Build outputs of the Mojo object seam (target.mk SRC_O):
+# build/scene.o and build/painter.o
+build/
+*.o
