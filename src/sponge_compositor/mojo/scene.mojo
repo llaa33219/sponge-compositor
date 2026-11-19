@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# scene.mojo — G1 scene model, view stack, command reducer, clipping/damage,
-# and composition driver for the Sponge compositor.
+# scene.mojo — G1/G2 scene model, view stack, command reducer,
+# clipping/damage, surface binding, and composition driver for the Sponge
+# compositor.
 #
 # Part of the Mojo-owned compositor core (plan D16C.3): the scene/session/
 # view stack, the command reducer, clipping and damage computation, and the
 # opaque painter driver live here in Mojo, not in C++. The C++ side (a later
 # gate) adapts Genode Gui/Capture/Event sessions and calls the C ABI
 # recorded in ../abi.h.
+#
+# G2 additions: per-view alpha/input-mask plane bindings (hit testing in
+# input.mojo), the pointer/button/hover/focus/pressed/exclusive input state
+# fields of Scene_state (reused by input.mojo; no module globals), and the
+# fixed-width delivery-tuple queue drained by sc_input_step. State hygiene
+# for input (dropping slot references on view destruction and queued
+# deliveries on session close) lives here next to the tables it protects.
 #
 # State storage (caller-provided). The scene state lives in a raw byte
 # block owned by the caller: the thin C++ Genode adapter allocates
@@ -22,8 +30,8 @@
 # references no storage symbols of its own, so the emitted objects keep an
 # empty `nm -u` (no KGEN runtime, no libc, no heap, no List).
 #
-# Capacities are fixed: 8 sessions, 32 views, 3 damage rects
-# (InlineArray only, no heap). Status codes follow ../abi.h:
+# Capacities are fixed: 8 sessions, 32 views, 3 damage rects, 32 queued
+# delivery tuples (InlineArray only, no heap). Status codes follow ../abi.h:
 #   0 = OK, -1 = bad args, -2 = capacity, -3 = unknown handle/id.
 #
 # View ids. `view_id` and `neighbor` are 64-bit end to end (UInt64 here,
@@ -56,6 +64,14 @@ comptime CAP_SESSIONS = 8
 comptime CAP_VIEWS = 32
 comptime CAP_DAMAGE = 3
 comptime STORAGE_BYTES = 8192
+
+# G2 delivery-tuple queue (see ../abi.h "delivery tuples"): each queued
+# event is SC_EVENT_TUPLE_INTS = 8 consecutive Int32 words, the queue
+# holds CAP_TUPLES tuples flat (QUEUE_WORDS = CAP_TUPLES * TUPLE_INTS,
+# power of two so the indexing discipline can use a bitwise AND).
+comptime CAP_TUPLES = 32
+comptime TUPLE_INTS = 8
+comptime QUEUE_WORDS = 256
 
 # Opcodes of the public Gui command surface
 # (public header `os/include/gui_session/gui_session.h`:
@@ -96,6 +112,14 @@ struct View(Copyable, Movable):
     var off_y: Int32
     var pitch: Int32
     var pixels: Optional[UnsafePointer[UInt32, MutUntrackedOrigin]]
+    # G2 surface planes (see sc_view_bind_surfaces). The alpha plane makes
+    # the view "alpha-enabled" for hit testing; the input-mask plane (byte
+    # per pixel: nonzero = consume, 0 = fall through) is consulted only for
+    # alpha-enabled views. Byte pitches, like the pixel pitch in bytes.
+    var alpha: Optional[UnsafePointer[UInt8, MutUntrackedOrigin]]
+    var alpha_pitch: Int32
+    var mask: Optional[UnsafePointer[UInt8, MutUntrackedOrigin]]
+    var mask_pitch: Int32
 
 
 @fieldwise_init
@@ -109,12 +133,36 @@ struct Scene_state(Copyable, Movable):
     var stack_n: Int32
     var damage: InlineArray[Rect, 3]
     var damage_n: Int32
+    # G2 input state (operated on by input.mojo; stored here so the
+    # caller's single state block keeps holding every scene field).
+    # Pointer position is clamped to the screen and starts at (0, 0).
+    # `buttons` is the held mouse-button bitmask (bit 0 = BTN_LEFT,
+    # 1 = BTN_RIGHT, 2 = BTN_MIDDLE); `key_cnt` counts all held keys.
+    # `hovered`, `focused`, and `pressed` (the current input receiver)
+    # are view-slot indices or -1. `exclusive` routes relative motion to
+    # the focused view without moving the pointer (upstream "exclusive
+    # input"). `drag` is set once a button-held sequence has seen motion.
+    # `seq` is the delivery sequence counter (tuple slot 6). `evq` is the
+    # flat delivery-tuple queue (evq_n tuples of TUPLE_INTS Int32 words).
+    var ptr_x: Int32
+    var ptr_y: Int32
+    var buttons: Int32
+    var key_cnt: Int32
+    var hovered: Int32
+    var focused: Int32
+    var pressed: Int32
+    var exclusive: Int32
+    var drag: Int32
+    var seq: Int32
+    var evq_n: Int32
+    var key_bits: InlineArray[UInt32, 16]
+    var evq: InlineArray[Int32, 256]
 
 
 # Scene_state fits well under SC_SCENE_STORAGE_BYTES (8 sessions * 8 B +
-# 32 views * 56 B + 32 * 4 B + 3 * 16 B + scalars ~= 2.4 KiB). C++
-# allocates the full 8192 bytes; the layout above is private to this
-# module.
+# 32 views * 80 B + 32 * 4 B + 3 * 16 B + scalars + 16 * 4 B key bitmap +
+# 256 * 4 B tuple queue ~= 3.9 KiB). C++ allocates the full 8192 bytes;
+# the layout above is private to this module.
 
 
 # ----------------------------------------------------------------------
@@ -415,6 +463,45 @@ def damage_view(s: UnsafePointer[Scene_state, MutUntrackedOrigin], slot: Int32):
 
 
 # ----------------------------------------------------------------------
+# G2 input-state hygiene. The input machine (input.mojo) addresses views
+# by slot, so destroying a view silently clears any hovered/focused/
+# pressed reference to its slot (no delivery is claimed: the session is
+# going away). Closing a session additionally drops queued delivery
+# tuples addressed to that session so input can never leak to a stale
+# session handle. Tuple layout: TUPLE_INTS words, session handle at
+# word 0 (see ../abi.h "delivery tuples").
+# ----------------------------------------------------------------------
+
+
+def clear_slot_refs(s: UnsafePointer[Scene_state, MutUntrackedOrigin], slot: Int32):
+    if s[0].hovered == slot:
+        s[0].hovered = -1
+    if s[0].focused == slot:
+        s[0].focused = -1
+    if s[0].pressed == slot:
+        s[0].pressed = -1
+
+
+def drop_queue_for_session(
+    s: UnsafePointer[Scene_state, MutUntrackedOrigin], handle: Int32
+):
+    var w = 0
+    var r = 0
+    while r < Int(s[0].evq_n):
+        if s[0].evq[(r * TUPLE_INTS) & (QUEUE_WORDS - 1)] != handle:
+            if w != r:
+                var k = 0
+                while k < TUPLE_INTS:
+                    s[0].evq[((w * TUPLE_INTS) + k) & (QUEUE_WORDS - 1)] = s[0].evq[
+                        ((r * TUPLE_INTS) + k) & (QUEUE_WORDS - 1)
+                    ]
+                    k += 1
+            w += 1
+        r += 1
+    s[0].evq_n = Int32(w)
+
+
+# ----------------------------------------------------------------------
 # Exported C ABI (contract: ../abi.h). Every entry point receives the
 # caller-provided state block as its first argument and rejects a null
 # block before touching it.
@@ -452,6 +539,17 @@ def sc_scene_init(
     s[0].bg = (UInt32(bg_r) << 16) | (UInt32(bg_g) << 8) | UInt32(bg_b)
     s[0].stack_n = 0
     s[0].damage_n = 0
+    s[0].ptr_x = 0
+    s[0].ptr_y = 0
+    s[0].buttons = 0
+    s[0].key_cnt = 0
+    s[0].hovered = -1
+    s[0].focused = -1
+    s[0].pressed = -1
+    s[0].exclusive = 0
+    s[0].drag = 0
+    s[0].seq = 0
+    s[0].evq_n = 0
     var i = 0
     while i < CAP_SESSIONS:
         s[0].sessions[i & (CAP_SESSIONS - 1)].active = 0
@@ -470,7 +568,15 @@ def sc_scene_init(
         s[0].views[j & (CAP_VIEWS - 1)].off_y = 0
         s[0].views[j & (CAP_VIEWS - 1)].pitch = 0
         s[0].views[j & (CAP_VIEWS - 1)].pixels = None
+        s[0].views[j & (CAP_VIEWS - 1)].alpha = None
+        s[0].views[j & (CAP_VIEWS - 1)].alpha_pitch = 0
+        s[0].views[j & (CAP_VIEWS - 1)].mask = None
+        s[0].views[j & (CAP_VIEWS - 1)].mask_pitch = 0
         j += 1
+    var kb = 0
+    while kb < 16:
+        s[0].key_bits[kb & 15] = UInt32(0)
+        kb += 1
     var k = 0
     while k < CAP_VIEWS:
         s[0].stack[k & (CAP_VIEWS - 1)] = 0
@@ -519,9 +625,13 @@ def sc_session_close(state: UnsafePointer[UInt8, MutUntrackedOrigin], handle: In
             stack_remove(s, Int32(j))
             s[0].views[j & (CAP_VIEWS - 1)].active = 0
             s[0].views[j & (CAP_VIEWS - 1)].pixels = None
+            s[0].views[j & (CAP_VIEWS - 1)].alpha = None
+            s[0].views[j & (CAP_VIEWS - 1)].mask = None
+            clear_slot_refs(s, Int32(j))
             _ = damage_add_rect(s, v.x, v.y, v.w, v.h)
         j += 1
     s[0].sessions[Int(handle) & (CAP_SESSIONS - 1)].active = 0
+    drop_queue_for_session(s, handle)
     return 0
 
 
@@ -596,6 +706,9 @@ def sc_view_destroy(
     _ = damage_add_rect(s, v.x, v.y, v.w, v.h)
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].active = 0
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pixels = None
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha = None
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask = None
+    clear_slot_refs(s, slot)
     return 0
 
 
@@ -625,6 +738,68 @@ def sc_view_bind_pixels(
     var px = pixels.value()
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pixels = px
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pitch = pitch
+    # Compatibility binding: replaces the whole surface set, so any
+    # alpha/input-mask planes from sc_view_bind_surfaces are dropped and
+    # the view hit-tests as opaque again.
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha = None
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha_pitch = 0
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask = None
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask_pitch = 0
+    var v = s[0].views[Int(slot) & (CAP_VIEWS - 1)].copy()
+    _ = damage_add_rect(s, v.x, v.y, v.w, v.h)
+    return 0
+
+
+
+@export("sc_view_bind_surfaces")
+def sc_view_bind_surfaces(
+    state: UnsafePointer[UInt8, MutUntrackedOrigin],
+    session: Int32,
+    view_id: UInt64,
+    pixels: Optional[UnsafePointer[UInt32, MutUntrackedOrigin]],
+    pixel_pitch: Int32,
+    alpha: Optional[UnsafePointer[UInt8, MutUntrackedOrigin]],
+    alpha_pitch: Int32,
+    input_mask: Optional[UnsafePointer[UInt8, MutUntrackedOrigin]],
+    input_mask_pitch: Int32,
+) abi("C") -> Int32:
+    if is_null_state(state):
+        return -1
+    if session < 0 or session >= Int32(CAP_SESSIONS):
+        return -3
+    var s = state_of(state)
+    if s[0].sessions[Int(session) & (CAP_SESSIONS - 1)].active == 0:
+        return -3
+    var slot = find_view(s, session, view_id)
+    if slot < 0:
+        return -3
+    if not pixels:
+        return -1
+    if pixel_pitch <= 0 or (pixel_pitch & 3) != 0:
+        return -1
+    # Optional planes are all-or-nothing: a bound byte plane needs a
+    # positive pitch; an unbound plane is stored as absent.
+    if alpha:
+        if alpha_pitch <= 0:
+            return -1
+    if input_mask:
+        if input_mask_pitch <= 0:
+            return -1
+    var px = pixels.value()
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].pixels = px
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].pitch = pixel_pitch
+    if alpha:
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha = alpha.value()
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha_pitch = alpha_pitch
+    else:
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha = None
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha_pitch = 0
+    if input_mask:
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask = input_mask.value()
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask_pitch = input_mask_pitch
+    else:
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask = None
+        s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask_pitch = 0
     var v = s[0].views[Int(slot) & (CAP_VIEWS - 1)].copy()
     _ = damage_add_rect(s, v.x, v.y, v.w, v.h)
     return 0
@@ -720,6 +895,14 @@ def sc_damage_add(
         return -1
     var s = state_of(state)
     return damage_add_rect(s, x, y, w, h)
+
+
+@export("sc_damage_count")
+def sc_damage_count(state: UnsafePointer[UInt8, MutUntrackedOrigin]) abi("C") -> Int32:
+    if is_null_state(state):
+        return -1
+    var s = state_of(state)
+    return s[0].damage_n
 
 
 @export("sc_compose")
