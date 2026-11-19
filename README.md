@@ -9,10 +9,11 @@ stacking, clipping/damage, and a real Capture consumer) plus the G2 input
 battery on seL4 QEMU. G1 rasters match upstream nitpicker byte-for-byte.
 G2 delivers real QMP clicks, alpha/input-mask fall-through, focus
 transitions, deterministic Event injection, and pointer-report validation
-through the public Genode surface. Upstream nitpicker remains the shipped
-default. Native composition is used only with the explicit
-`SPONGE_COMPOSITOR=native` opt-in; the native-default flip is a separate,
-later commit and is not shipped here.
+through the public Genode surface. Tier-0 selection is default-native:
+unset or `SPONGE_COMPOSITOR=native` runs `sponge_compositor`, and
+`SPONGE_COMPOSITOR=upstream` runs the explicit nitpicker fallback
+(any other value fails loudly). The user approved the native default on
+2026-11-19, after the green G2 receipts.
 
 ## Architecture
 
@@ -54,23 +55,28 @@ toolchain using `--emit object --relocation-model=pic --target-cpu=x86-64`.
 G1 (opaque raster):
 
 ```bash
+SPONGE_COMPOSITOR=upstream make -C <build-dir> run/sponge-compositor-opaque KERNEL=sel4 BOARD=pc
 make -C <build-dir> run/sponge-compositor-opaque KERNEL=sel4 BOARD=pc
-SPONGE_COMPOSITOR=native make -C <build-dir> run/sponge-compositor-opaque KERNEL=sel4 BOARD=pc
 SPONGE_COMPOSITOR=native make -C <build-dir> run/sponge-compositor-diff KERNEL=sel4 BOARD=pc
 ```
 
-The first command is the upstream oracle, the second the native golden,
-and the third the native-vs-upstream differential. Both rasters match
-byte-for-byte with FNV-1a-64 checksum `0x670d6b5d9fc0ed7b`.
+The first command is the upstream oracle, pinned to the explicit
+`SPONGE_COMPOSITOR=upstream` override because native is the default. The
+second is the native golden (the default selection; the explicit
+`SPONGE_COMPOSITOR=native` spelling is its equivalent), and the third is
+the native-vs-upstream differential, which names its native arm with the
+explicit override. Both rasters match byte-for-byte with FNV-1a-64
+checksum `0x670d6b5d9fc0ed7b`.
 
 G2 (input battery):
 
 ```bash
 make -C <build-dir> run/sponge-compositor-input KERNEL=sel4 BOARD=pc
-SPONGE_COMPOSITOR=native make -C <build-dir> run/sponge-compositor-input KERNEL=sel4 BOARD=pc
+SPONGE_COMPOSITOR=upstream make -C <build-dir> run/sponge-compositor-input KERNEL=sel4 BOARD=pc
 ```
 
-Both Tier-0s pass all five phases and the overall `g2-input: PASS` marker.
+The first command is the default-native run, the second the explicit
+upstream fallback. Both Tier-0s pass all five phases and the overall `g2-input: PASS` marker.
 The exact Event-injection differential `g2-input: trace-inject` matches on
 both (`0xc50006d9e1676755`). The full-trace digest `g2-input: trace` is
 diagnostic only, not a stability gate. A bounded record comparison showed
@@ -90,6 +96,6 @@ integration, GPU acceleration, and physical-hardware validation are outside
 G1/G2 and are not claimed. Alpha input masks are consumed for hit testing
 from G2 on, but blending translucent views is not implemented. Unsupported
 protocol corners warn loudly or return documented safe results. Capacities
-are 8 sessions, 32 views, and 3 merged damage rectangles. The default stays
-upstream nitpicker; native-default selection ships only in a separate later
-commit.
+are 8 sessions, 32 views, and 3 merged damage rectangles. Native is the
+default selection; `SPONGE_COMPOSITOR=upstream` keeps the nitpicker
+fallback reachable as an explicit override.
