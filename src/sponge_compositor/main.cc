@@ -4,15 +4,17 @@
  *
  * Thin C++ entry adapter only (AGENTS.md §3.6): read the native config,
  * provide the raw scene-state block, initialize the Mojo-owned scene
- * exactly once through the C ABI (abi.h), and construct + announce the
- * three public roots (Gui, Capture, Event). No scene state or logic
- * exists in C++: every scene field, reducer decision, stacking rule,
- * clipping/damage computation, and painter operation is Mojo-owned.
+ * exactly once through the C ABI (abi.h), construct the input pipeline,
+ * and construct + announce the three public roots (Gui, Capture, Event).
+ * No scene state or logic exists in C++: every scene field, reducer
+ * decision, stacking rule, clipping/damage computation, and painter
+ * operation is Mojo-owned.
  *
  * Config (run/compositor.inc native node):
  *
- *   <config width="1024" height="768">
+ *   <config width="1024" height="768" request_input="yes">
  *     <background color="#1e1e2e"/>
+ *     <report pointer="yes" hover="yes"/>
  *   </config>
  */
 
@@ -26,6 +28,7 @@
 #include "capture_adapter.h"
 #include "event_adapter.h"
 #include "gui_adapter.h"
+#include "input_pipeline.h"
 
 namespace Sponge {
 
@@ -101,7 +104,7 @@ void Component::construct(Genode::Env &env)
 
 	static Genode::Attached_rom_dataspace config_rom { env, "config" };
 
-	Genode::Xml_node const config = config_rom.xml();
+	Genode::Node const &config = config_rom.node();
 
 	Genode::int32_t const width  = config.attribute_value("width",  DEFAULT_WIDTH);
 	Genode::int32_t const height = config.attribute_value("height", DEFAULT_HEIGHT);
@@ -110,7 +113,7 @@ void Component::construct(Genode::Env &env)
 	Genode::uint32_t bg_rgb  = DEFAULT_BG_RGB;
 	bool             bg_seen = false;
 
-	config.for_each_sub_node("background", [&] (Genode::Xml_node const &node) {
+	config.for_each_sub_node("background", [&] (Genode::Node const &node) {
 
 		if (bg_seen)
 			return;   /* first 'background' node wins */
@@ -160,6 +163,17 @@ void Component::construct(Genode::Env &env)
 	    Genode::Hex(bg_rgb, Genode::Hex::OMIT_PREFIX));
 
 	/*
+	 * Input pipeline (G2): the single input-routing seam over the
+	 * Mojo-owned input core. Constructed before the roots and handed
+	 * to Gui and Event (Capture is input-free and unchanged). The
+	 * pipeline owns the optional driver-side 'Input::Connection'
+	 * ('request_input="yes"') and the 'pointer'/'hover' reporters
+	 * ('<report pointer="yes" hover="yes"/>').
+	 */
+	static Sponge::Input_pipeline input_pipeline {
+		env, state, SCENE_STORAGE_BYTES, config };
+
+	/*
 	 * Public roots (never Static_root): construct and announce Gui,
 	 * Capture, and Event. The state block is shared with the Mojo core
 	 * and only ever passed through, never inspected. 'Gui_root' lives
@@ -168,7 +182,7 @@ void Component::construct(Genode::Env &env)
 	 * capture/event adapters.
 	 */
 	static Sponge::Gui_root gui_root {
-		env, heap, state, SCENE_STORAGE_BYTES, config };
+		env, heap, state, SCENE_STORAGE_BYTES, config, input_pipeline };
 	gui_root.announce();
 
 	static Capture_root capture_root {
@@ -176,7 +190,7 @@ void Component::construct(Genode::Env &env)
 	capture_root.announce();
 
 	static Event_root event_root {
-		env, heap, state, SCENE_STORAGE_BYTES };
+		env, heap, input_pipeline };
 	event_root.announce();
 }
 

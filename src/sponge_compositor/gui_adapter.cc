@@ -43,6 +43,7 @@ static Genode::uint64_t view_id_value(Gui::View_id id)
 Gui_session_component::Gui_session_component(
 	Genode::Env                &env,
 	Genode::uint8_t            *state,
+	Input_pipeline             &pipeline,
 	Genode::int32_t             scene_handle,
 	Genode::Session::Resources  const &resources,
 	Genode::Session::Label      const &label,
@@ -50,15 +51,25 @@ Gui_session_component::Gui_session_component(
 	Genode::int32_t             screen_h)
 :
 	Genode::Session_object<Gui::Session>(env.ep(), resources, label),
-	_env(env), _state(state), _handle(scene_handle),
+	_env(env), _state(state), _pipeline(pipeline), _handle(scene_handle),
 	_screen_w(screen_w), _screen_h(screen_h),
 	_fb(env, state, resources, label),
-	_input(env)
-{ }
+	_input(env, state)
+{
+	/*
+	 * Register this session's Input component with the input pipeline
+	 * (per-session delivery target + hover-report label). The
+	 * registration is dropped again in the destructor before the
+	 * scene session closes.
+	 */
+	_pipeline.register_session(_handle, &_input.component(), label);
+}
 
 
 Gui_session_component::~Gui_session_component()
 {
+	_pipeline.unregister_session(_handle);
+
 	/*
 	 * Close the scene session: all views of this session are removed
 	 * from the scene and their pixel bindings are dropped before the
@@ -105,11 +116,20 @@ void Gui_session_component::_bind_view(Genode::uint64_t id)
 	if (!pixels)
 		return;
 
-	Genode::int32_t const r = sc_view_bind_pixels(
-		_state, _handle, id, pixels, _fb.pitch());
+	/*
+	 * Bind the full surface set (abi.h): the pixel plane plus the
+	 * alpha and input-mask planes of an 'alpha' buffer. Non-alpha
+	 * buffers pass absent planes and keep the view hit-testing
+	 * opaque; an 'alpha' buffer consults its input-mask plane, where
+	 * a zero mask byte falls through to the views below.
+	 */
+	Genode::int32_t const r = sc_view_bind_surfaces(
+		_state, _handle, id, pixels, _fb.pitch(),
+		_fb.alpha(), _fb.byte_pitch(),
+		_fb.input_mask(), _fb.byte_pitch());
 
 	if (r != 0)
-		Genode::warning("sc_view_bind_pixels failed (", r, ") for view ", id);
+		Genode::warning("sc_view_bind_surfaces failed (", r, ") for view ", id);
 }
 
 
@@ -317,19 +337,55 @@ Gui_session_component::buffer(Framebuffer::Mode mode)
 		return Buffer_result::OUT_OF_RAM;
 
 	/*
-	 * Map the real 4-byte pixel dataspace into the scene through
-	 * sc_view_bind_pixels — on every buffer call, for every view of
-	 * this session (buffer hand-off may swap the dataspace under
-	 * existing views; abi.h rebind contract).
+	 * Map the real client dataspace into the scene through
+	 * sc_view_bind_surfaces (pixel plane plus alpha and input-mask
+	 * planes of an 'alpha' buffer) — on every buffer call, for every
+	 * view of this session (buffer hand-off may swap the dataspace
+	 * under existing views; abi.h rebind contract).
 	 */
 	_bind_all_views();
 	return Buffer_result::OK;
 }
 
 
-void Gui_session_component::focus(Gui::Session_capability /* focused */)
+void Gui_session_component::_forward_scene_focus()
 {
-	Genode::warning("not implemented before G2: focus");
+	for (unsigned i = 0; i < MAX_VIEWS; i++) {
+		if (_views[i].used) {
+			_pipeline.focus_forward(_handle, _views[i].id);
+			return;
+		}
+	}
+
+	Genode::warning("focus forwarding: session '", label(),
+	                "' has no view to focus");
+}
+
+
+void Gui_session_component::focus(Gui::Session_capability focused)
+{
+	if (!focused.valid()) {
+		Genode::warning("not implemented: focus reset (no G2 focus policy)");
+		return;
+	}
+
+	/*
+	 * Resolve the session capability to its server-side session object
+	 * (the public 'Object_pool::apply' seam, as upstream nitpicker's
+	 * 'Gui_session::focus') and forward the input focus to that
+	 * session.
+	 */
+	Gui_session_component *target = nullptr;
+
+	_env.ep().rpc_ep().apply(focused,
+		[&] (Gui_session_component *session) { target = session; });
+
+	if (!target) {
+		Genode::warning("focus: unknown session capability");
+		return;
+	}
+
+	target->_forward_scene_focus();
 }
 
 
@@ -377,10 +433,11 @@ void Gui_session_component::Info_rom::produce_xml(Genode::Xml_generator &xml)
 
 Gui_root::Gui_root(Genode::Env &env, Genode::Heap &heap,
                    Genode::uint8_t *state, Genode::uint64_t /* state_size */,
-                   Genode::Xml_node const &config)
+                   Genode::Node const &config,
+                   Input_pipeline &pipeline)
 :
 	Genode::Root_component<Gui_session_component>(env.ep(), heap),
-	_env(env), _state(state),
+	_env(env), _state(state), _pipeline(pipeline),
 	_screen_w(config.attribute_value("width",  1024)),
 	_screen_h(config.attribute_value("height", 768))
 { }
@@ -411,7 +468,7 @@ Gui_root::_create_session(char const *args, Genode::Affinity const &)
 	 * the session object; if the object cannot be allocated the handle
 	 * is closed again right here.
 	 */
-	return _alloc_obj(_env, _state, handle, resources, label,
+	return _alloc_obj(_env, _state, _pipeline, handle, resources, label,
 	                  _screen_w, _screen_h)
 		.template convert<Create_result>(
 			[&] (Gui_session_component &session) -> Gui_session_component & {

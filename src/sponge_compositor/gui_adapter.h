@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0
  *
  * gui_adapter.h — Gui service root and per-session Gui::Session adapter
- * for the Sponge compositor (G1, plan D16C.3).
+ * for the Sponge compositor (G2, plan D16C.3).
  *
  * The Gui session implementation maps the public Gui surface onto the
  * Mojo-owned scene ABI (abi.h):
@@ -13,8 +13,29 @@
  *                 sc_view_bind_pixels on every buffer call
  *   execute()     the shared C++ 'Command' union is decoded 1:1 into
  *                 sc_apply_command
+ *   focus()       focus forwarding through the input pipeline
+ *                 ('Input_pipeline::focus_forward' -> sc_focus_forward)
  *   info()        real 'Dynamic_rom_session' with the root 'panorama'
  *                 node (xpos/ypos/width/height) plus a capture sub-node
+ *
+ * Input integration (G2): each session owns a real per-session
+ * 'Input::Session_component' (input_adapter.h) and registers it with
+ * the shared 'Input_pipeline' at creation, keyed by the Mojo session
+ * handle and the client session label. Every routed input event is
+ * delivered to that component's event queue (input_pipeline.h); the
+ * registration is dropped again at destruction.
+ *
+ * Focus forwarding ('Gui::Session::focus', the external focus-policy
+ * seam): the session capability argument is resolved to its
+ * server-side session object and the input focus is forwarded to that
+ * session immediately ('sc_focus_forward' + immediate delivery of the
+ * queued leave-before-enter tuples). G2 forwards to the target
+ * session's first-created view: all views of one session share one
+ * Input channel, so the per-session event stream is the same for any
+ * representative view choice (per-view focus selection within one
+ * session is not modeled). A session without views cannot be focused
+ * (explicit warning). An invalid capability (focus reset) is not
+ * modeled in G2 (explicit warning).
  *
  * No scene state or logic exists in C++ (abi.h, D16C.10): the session
  * keeps only dataspace/session glue and the client-chosen view-id list
@@ -24,7 +45,7 @@
  *
  * The root is a public 'Genode::Root_component' (never 'Static_root'),
  * announced to the parent as 'Gui'. Unsupported surface
- * (child_view/associate/view_capability/release_view_id/focus and the
+ * (child_view/associate/view_capability/release_view_id and the
  * vestigial title/background command opcodes) degrades to explicit
  * "not implemented before G2" warnings or safe no-op/null results;
  * nothing crashes.
@@ -40,11 +61,12 @@
 #include <os/dynamic_rom_session.h>
 #include <root/component.h>
 #include <util/reconstructible.h>
-#include <util/xml_node.h>
+#include <base/node.h>
 
 #include "abi.h"
 #include "fb_adapter.h"
 #include "input_adapter.h"
+#include "input_pipeline.h"
 
 namespace Sponge {
 
@@ -55,6 +77,7 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 
 		Genode::Env       &_env;
 		Genode::uint8_t   *const _state;    /* Mojo scene state block */
+		Input_pipeline    &_pipeline;       /* input routing seam (G2) */
 		Genode::int32_t    const _handle;   /* scene session handle   */
 		Genode::int32_t    const _screen_w; /* info-ROM panorama      */
 		Genode::int32_t    const _screen_h;
@@ -63,10 +86,11 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 		 * Active view ids of this session (client-chosen 'View_id'
 		 * values, as passed to 'view()'). This is RPC bookkeeping
 		 * only: it exists so that 'buffer()' can (re)bind the session
-		 * pixel dataspace to every view of the session through
-		 * 'sc_view_bind_pixels', exactly as the buffer-hand-off
-		 * contract of abi.h requires. No geometry, stacking, pixel,
-		 * or damage state is kept here.
+		 * pixel dataspace and any alpha/input-mask planes to every view
+		 * through 'sc_view_bind_surfaces', exactly as the buffer-hand-off
+		 * contract of abi.h requires, and so that focus forwarding can
+		 * pick the session's first-created view. No geometry,
+		 * stacking, pixel, or damage state is kept here.
 		 */
 		enum { MAX_VIEWS = SC_MAX_VIEWS };
 
@@ -119,6 +143,9 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 
 		void _execute_command(Gui::Session::Command const &cmd);
 
+		/* focus forwarding target: first-created view of this session */
+		void _forward_scene_focus();
+
 	public:
 
 		/* noncopyable (pointer member, -Werror=effc++) */
@@ -130,16 +157,21 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 		 *
 		 * \param env           execution environment
 		 * \param state         Mojo scene state block (never inspected)
+		 * \param pipeline      shared input pipeline; this session's
+		 *                      Input component is registered there
+		 *                      (and unregistered at destruction)
 		 * \param scene_handle  handle returned by 'sc_session_open'
 		 *                      (owned by this session; closed at
 		 *                      destruction)
 		 * \param resources     client-donated session resources
-		 * \param label         client session label
+		 * \param label         client session label (feeds the input
+		 *                      pipeline's hover report)
 		 * \param screen_w      screen width for the info ROM
 		 * \param screen_h      screen height for the info ROM
 		 */
 		Gui_session_component(Genode::Env                  &env,
 		                      Genode::uint8_t              *state,
+		                      Input_pipeline               &pipeline,
 		                      Genode::int32_t               scene_handle,
 		                      Genode::Session::Resources    const &resources,
 		                      Genode::Session::Label        const &label,
@@ -183,6 +215,7 @@ struct Gui_root : Genode::Root_component<Gui_session_component>
 
 		Genode::Env         &_env;
 		Genode::uint8_t     *const _state;
+		Input_pipeline      &_pipeline;
 		Genode::int32_t      const _screen_w;
 		Genode::int32_t      const _screen_h;
 
@@ -212,10 +245,14 @@ struct Gui_root : Genode::Root_component<Gui_session_component>
 		 *                   state pointer only)
 		 * \param config     native config node ('width'/'height'
 		 *                   attributes feed the info-ROM panorama)
+		 * \param pipeline   shared input pipeline handed to every
+		 *                   session (input registration and focus
+		 *                   forwarding)
 		 */
 		Gui_root(Genode::Env &env, Genode::Heap &heap,
 		         Genode::uint8_t *state, Genode::uint64_t state_size,
-		         Genode::Xml_node const &config);
+		         Genode::Node const &config,
+		         Input_pipeline &pipeline);
 
 		/**
 		 * Announce the 'Gui' root to the parent
