@@ -1,14 +1,16 @@
 /* SPDX-License-Identifier: Apache-2.0
  *
- * abi.h — C ABI of the Mojo-owned Sponge compositor core (G1).
+ * abi.h — C ABI of the Mojo-owned Sponge compositor core (G1/G2).
  *
  * This header is the complete seam between the thin C++ Genode adapter
- * and the Mojo compositor core (`mojo/scene.mojo`, `mojo/painter.mojo`).
- * The Mojo side owns the scene/session/view stack, the command reducer,
- * clipping and damage, and the opaque painter (plan D16C.3); the C++
- * side allocates/maps pixel buffers, adapts Genode Gui/Capture/Event
- * sessions, and calls the entry points declared here. There is no second
- * scene model in C++ (D16C.10).
+ * and the Mojo compositor core (`mojo/scene.mojo`, `mojo/painter.mojo`,
+ * `mojo/input.mojo`). The Mojo side owns the scene/session/view stack,
+ * the command reducer, clipping and damage, the opaque painter
+ * (plan D16C.3, G1), and the input state, alpha/input-mask hit testing,
+ * pointer/focus state, and input-event reduction (G2); the C++ side
+ * allocates/maps pixel buffers, adapts Genode Gui/Capture/Event/Input
+ * sessions, and calls the entry points declared here. There is no
+ * second scene model in C++ (D16C.10).
  *
  * State storage contract. The scene state lives in a raw byte block
  * owned by the caller: the C++ adapter allocates exactly
@@ -57,10 +59,12 @@ extern "C" {
  *   -3  unknown handle or id (stale session handle, stale view id,
  *       unknown stacking neighbor). Stale ids never corrupt state.
  *
- * Two entry points carry data in the return value instead:
+ * A few entry points carry data in the return value instead:
  * sc_session_open returns the new session handle (>= 0) or a negative
- * status, and sc_damage_fetch returns the number of rects written
- * (0..3) or a negative status. Both are documented below.
+ * status, sc_damage_fetch and sc_input_step return the number of
+ * written rects/tuples, sc_damage_count returns the pending damage
+ * count, and sc_pointer_pos reports the position through out-params.
+ * All are documented below.
  */
 
 /* Size in bytes of the caller-provided scene state block. */
@@ -128,6 +132,17 @@ enum {
  * matching the public Gui `View_id` (`Id_space<View_ref>::Id`,
  * `unsigned long` in `os/include/gui_session/gui_session.h`). Ids are
  * caller-chosen per session and are never narrowed to 32 bits.
+ *
+ * Alpha and input-mask planes (sc_view_bind_surfaces). The plane layout
+ * matches the public `os/include/framebuffer_session/framebuffer_session.h`
+ * Mode contract in split form: the alpha plane is one byte per pixel and
+ * the input-mask plane one byte per pixel. An input-mask byte of zero
+ * passes input through the view to the views below; any other byte
+ * (nominally one) consumes the input at that pixel. Byte-plane pitches
+ * are row pitches in BYTES (no alignment requirement beyond being
+ * positive); the buffer-extent contract above applies per plane: each
+ * bound plane must provide `pitch` bytes per row over the rows
+ * `off_y .. off_y + h - 1` and at least `off_x + w` bytes per such row.
  */
 
 /* ------------------------------------------------------------------ */
@@ -209,9 +224,11 @@ Genode::int32_t sc_view_destroy(Genode::uint8_t *state,
 
 /*
  * Bind (or re-bind) the pixel buffer of a view. May be called on every
- * buffer hand-off; the binding is replaced wholesale. `pixels` points
- * at the pixel word for buffer coordinate (0, 0); see the buffer
- * extent contract above. NULL `pixels` or a bad pitch is -1.
+ * buffer hand-off; the binding is replaced wholesale, including any
+ * alpha/input-mask planes bound with sc_view_bind_surfaces (the view
+ * hit-tests as opaque again). `pixels` points at the pixel word for
+ * buffer coordinate (0, 0); see the buffer extent contract above. NULL
+ * `pixels` or a bad pitch is -1.
  *
  * Returns 0, -1 for bad arguments (including a NULL state block), or
  * -3 for unknown session/view.
@@ -221,6 +238,33 @@ Genode::int32_t sc_view_bind_pixels(Genode::uint8_t *state,
                                     Genode::uint64_t view_id,
                                     Genode::uint32_t const *pixels,
                                     Genode::int32_t pitch);
+
+/*
+ * Bind (or re-bind) the full surface set of a view: the pixel plane
+ * (required, as for sc_view_bind_pixels) plus optional alpha and
+ * input-mask planes (each NULL or a valid plane with a positive byte
+ * pitch; NULL clears that plane). The binding is replaced wholesale on
+ * every call. The planes drive hit testing (see "Hit testing and input
+ * delivery" below): a view with no alpha plane is opaque and consumes
+ * every input point inside its rect; an alpha-enabled view consults its
+ * input-mask plane where zero falls through to the views below and
+ * nonzero consumes; an alpha-enabled view without a mask plane consumes
+ * inside its rect. A mask plane bound without an alpha plane has no
+ * effect.
+ *
+ * Returns 0; -1 for a NULL state block, NULL pixels, a non-positive or
+ * non-4-byte pixel pitch, or a non-positive pitch of a bound byte
+ * plane; -3 for an unknown session or stale view id.
+ */
+Genode::int32_t sc_view_bind_surfaces(Genode::uint8_t *state,
+                                      Genode::int32_t session,
+                                      Genode::uint64_t view_id,
+                                      Genode::uint32_t const *pixels,
+                                      Genode::int32_t pixel_pitch,
+                                      Genode::uint8_t const *alpha,
+                                      Genode::int32_t alpha_pitch,
+                                      Genode::uint8_t const *input_mask,
+                                      Genode::int32_t input_mask_pitch);
 
 /*
  * Apply one Gui command to a view (command reducer). The arguments are
@@ -258,6 +302,191 @@ Genode::int32_t sc_apply_command(Genode::uint8_t *state,
                                  Genode::uint64_t neighbor);
 
 /* ------------------------------------------------------------------ */
+/* Hit testing and input delivery (G2)                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Event-type constants, matching Input::Event::Type of the public
+ * `os/include/input/event.h` (declaration order is binding):
+ *
+ *   INVALID, PRESS, RELEASE, REL_MOTION, ABS_MOTION, WHEEL,
+ *   FOCUS_ENTER, FOCUS_LEAVE, HOVER_LEAVE, TOUCH, TOUCH_RELEASE,
+ *   SEQ_NUMBER, AXIS
+ */
+enum {
+	SC_EV_INVALID       = 0,
+	SC_EV_PRESS         = 1,
+	SC_EV_RELEASE       = 2,
+	SC_EV_REL_MOTION    = 3,
+	SC_EV_ABS_MOTION    = 4,
+	SC_EV_WHEEL         = 5,
+	SC_EV_FOCUS_ENTER   = 6,
+	SC_EV_FOCUS_LEAVE   = 7,
+	SC_EV_HOVER_LEAVE   = 8,
+	SC_EV_TOUCH         = 9,
+	SC_EV_TOUCH_RELEASE = 10,
+	SC_EV_SEQ_NUMBER    = 11,
+	SC_EV_AXIS          = 12
+};
+
+/*
+ * Keycode constants of the public `os/include/input/keycodes.h` used by
+ * this ABI. Flattened event keys must lie in [0, SC_KEY_MAX).
+ * SC_CODEPOINT_INVALID is `Codepoint::INVALID` of `os/include/util/utf8.h`.
+ */
+enum {
+	SC_KEY_MAX           = 0x1ff,
+	SC_BTN_LEFT          = 0x110,
+	SC_BTN_RIGHT         = 0x111,
+	SC_BTN_MIDDLE        = 0x112,
+	SC_BTN_TOUCH         = 0x14a,
+	SC_CODEPOINT_INVALID = 0xfffe
+};
+
+/*
+ * Delivery tuples. sc_input_step reports delivered events as fixed-width
+ * scalar tuples (no aggregates cross the ABI): each tuple is exactly
+ * SC_EVENT_TUPLE_INTS consecutive Genode::int32_t words,
+ *
+ *     [0] session    target session handle
+ *     [1] type       SC_EV_* value (the delivered event type)
+ *     [2] x          motion/wheel x (screen coordinates for
+ *                    SC_EV_ABS_MOTION, deltas for SC_EV_REL_MOTION and
+ *                    SC_EV_WHEEL; the value for SC_EV_SEQ_NUMBER)
+ *     [3] y          motion/wheel y
+ *     [4] key        keycode for SC_EV_PRESS/SC_EV_RELEASE, else 0
+ *     [5] codepoint  character code for SC_EV_PRESS, else 0
+ *     [6] seq        delivery sequence number: 1-based, strictly
+ *                    increasing in emission order per state block
+ *     [7] reserved   0
+ *
+ * out_events buffers `max_out` tuples, i.e. max_out * SC_EVENT_TUPLE_INTS
+ * words. Tuples are emitted oldest-first.
+ */
+enum { SC_EVENT_TUPLE_INTS = 8 };
+
+/*
+ * Hit testing runs top-down over the view stack (topmost view first) and
+ * stops at the first consuming view: a point outside every view rect
+ * delivers to no view; a view without an alpha plane consumes every
+ * point inside its rect; an alpha-enabled view consults its input-mask
+ * plane at buffer coordinate (px - x + off_x, py - y + off_y) - mask
+ * byte 0 falls through to the views below, nonzero consumes; an
+ * alpha-enabled view without a mask plane consumes inside its rect.
+ */
+
+/*
+ * Consume one flattened Input::Event and report the resulting deliveries.
+ *
+ * ev_type is an SC_EV_* value; the attributes are flattened scalars:
+ *
+ *   SC_EV_PRESS         a = keycode, b = codepoint
+ *                       (SC_CODEPOINT_INVALID for no character)
+ *   SC_EV_RELEASE       a = keycode
+ *   SC_EV_REL_MOTION    a = dx, b = dy
+ *   SC_EV_ABS_MOTION    a = x, b = y (screen coordinates)
+ *   SC_EV_WHEEL         a = x, b = y
+ *   SC_EV_SEQ_NUMBER    a = sequence value
+ *   SC_EV_INVALID       drain-only: consumes nothing, only flushes
+ *                       queued tuples
+ *   SC_EV_FOCUS_ENTER, SC_EV_FOCUS_LEAVE, SC_EV_HOVER_LEAVE are
+ *   delivery-only types; SC_EV_TOUCH, SC_EV_TOUCH_RELEASE and SC_EV_AXIS
+ *   are not modeled in G2. All are accepted with no state change and no
+ *   delivery claimed. c and d are reserved attribute slots (0).
+ *
+ * Behavior (matches upstream nitpicker's public-server semantics where
+ * G2 covers it):
+ *   - SC_EV_ABS_MOTION clamps the pointer to the screen and delivers the
+ *     clamped screen position. SC_EV_REL_MOTION converts to absolute
+ *     motion the same way (from (0, 0) before the first motion) unless
+ *     exclusive input is set, in which case it stays relative and is
+ *     delivered to the focused view without moving the pointer.
+ *   - Motion with no button held updates the hover: on change the old
+ *     view receives SC_EV_HOVER_LEAVE and the new view the position
+ *     twice (hover update plus forwarded motion, as upstream delivers).
+ *   - The first held button starts a key sequence: a mouse button on a
+ *     not-yet-focused view emits SC_EV_FOCUS_LEAVE to the old focus
+ *     BEFORE SC_EV_ABS_MOTION + SC_EV_FOCUS_ENTER to the clicked view
+ *     (then the press). While any button is held, motion stays with the
+ *     press receiver ("drag to pressed"), hover updates are suppressed,
+ *     and the receiver is told SC_EV_HOVER_LEAVE when the hover was
+ *     pinned to a different view. The release ends the sequence with a
+ *     hover update and, after a drag, an SC_EV_HOVER_LEAVE to a
+ *     receiver that is no longer hovered (upstream parity).
+ *   - SC_EV_WHEEL goes to the press receiver (the focused view outside
+ *     sequences); SC_EV_SEQ_NUMBER goes to the hovered view, else the
+ *     focused one.
+ *   - Suspicious double presses and releases (same key twice without an
+ *     opposite event in between) are dropped with no delivery.
+ *
+ * The event is consumed and its state effects applied on every return
+ * except -1 and -2. Delivery tuples are queued FIFO and written to
+ * out_events oldest-first; tuples that do not fit stay queued and are
+ * written by later calls (including SC_EV_INVALID drains), so no
+ * delivery is ever lost.
+ *
+ * Returns the number of tuples written (0..max_out), or:
+ *   -1  bad arguments (NULL state block, ev_type outside 0..12, a
+ *       keycode outside [0, SC_KEY_MAX), negative max_out, or NULL
+ *       out_events),
+ *   -2  a tuple-producing event found no room in the state's delivery
+ *       queue for its worst-case tuples; the event is NOT consumed.
+ *       Drain queued tuples first (SC_EV_INVALID with a sufficient
+ *       max_out; drains are never rejected), then retry.
+ */
+Genode::int32_t sc_input_step(Genode::uint8_t *state,
+                              Genode::int32_t ev_type,
+                              Genode::int32_t a,
+                              Genode::int32_t b,
+                              Genode::int32_t c,
+                              Genode::int32_t d,
+                              Genode::int32_t *out_events,
+                              Genode::int32_t max_out);
+
+/*
+ * Forward the input focus to the view `target` (64-bit view id) of
+ * `session` - the external focus-policy seam (upstream nitpicker
+ * 'User_state::focus'). On a change the old focus receives
+ * SC_EV_FOCUS_LEAVE and the new one SC_EV_FOCUS_ENTER (no motion tuple;
+ * click focus sends the position, external forwarding does not). The
+ * tuples are queued like sc_input_step deliveries and drained by the
+ * next sc_input_step call. Forwarding to the already-focused view is a
+ * no-op. The press receiver of an in-flight key sequence is left alone,
+ * so press/release pairs stay on one session (upstream applies focus
+ * changes between drag operations; this call applies immediately and
+ * the caller should serialize focus changes outside button sequences).
+ *
+ * Returns 0, or -1 for a NULL state block, or -3 for an unknown session
+ * or stale view id, or -2 when the delivery queue has no room for the
+ * focus tuples (nothing is changed; drain first).
+ */
+Genode::int32_t sc_focus_forward(Genode::uint8_t *state,
+                                 Genode::int32_t session,
+                                 Genode::uint64_t target);
+
+/*
+ * Report the current pointer position. The position is clamped to the
+ * screen and starts at (0, 0) after sc_scene_init; relative motion
+ * materializes from there before the first absolute position.
+ *
+ * Returns 0, or -1 for a NULL state block or NULL out_x/out_y.
+ */
+Genode::int32_t sc_pointer_pos(Genode::uint8_t *state,
+                               Genode::int32_t *out_x,
+                               Genode::int32_t *out_y);
+
+/*
+ * Enable (enabled != 0) or disable exclusive input: while enabled,
+ * relative-motion events are delivered as SC_EV_REL_MOTION to the
+ * focused view without moving the pointer (upstream "exclusive input",
+ * Input::Session::exclusive).
+ *
+ * Returns 0, or -1 for a NULL state block.
+ */
+Genode::int32_t sc_input_exclusive(Genode::uint8_t *state,
+                                   Genode::int32_t enabled);
+
+/* ------------------------------------------------------------------ */
 /* Damage and composition                                               */
 /* ------------------------------------------------------------------ */
 
@@ -278,6 +507,16 @@ Genode::int32_t sc_damage_add(Genode::uint8_t *state,
                               Genode::int32_t y,
                               Genode::int32_t w,
                               Genode::int32_t h);
+
+/*
+ * Report how many damage rects are pending (0..SC_MAX_DAMAGE) without
+ * consuming them - the wakeup-signaling seam (an adapter can compare
+ * the count and only wake Capture consumers when it changed). Unlike
+ * sc_damage_fetch this never writes anything and never clears damage.
+ *
+ * Returns the pending count, or -1 for a NULL state block.
+ */
+Genode::int32_t sc_damage_count(Genode::uint8_t *state);
 
 /*
  * Compose the current scene into the caller-provided screen buffer
