@@ -2,9 +2,10 @@
 #
 # The C++ side is the thin Genode adapter only (AGENTS.md §3.6):
 # 'Component::construct' entry glue, the Gui/Framebuffer/Input RPC
-# adapters, the capture/event adapters, and the 'Genode::Heap' KGEN
-# shim. The scene/painter core is Mojo-owned (D16C.3) and enters the
-# target as pre-compiled objects through 'SRC_O' (D16C.4): each Mojo
+# adapters, the G2 input pipeline, the capture/event adapters, and the
+# 'Genode::Heap' KGEN shim. The scene/painter/input core is Mojo-owned
+# (D16C.3) and enters the target as pre-compiled objects through
+# 'SRC_O' (D16C.4): each Mojo
 # unit is emitted with the pinned toolchain via
 # '$(SPONGE_ROOT)/tool/mojo_objects' (exact flags, loud drift).
 
@@ -14,11 +15,12 @@ SRC_CC   := main.cc \
             gui_adapter.cc \
             fb_adapter.cc \
             input_adapter.cc \
+            input_pipeline.cc \
             capture_adapter.cc \
             event_adapter.cc \
             kgen_shim.cc
 
-SRC_O    := build/scene.o build/painter.o
+SRC_O    := build/scene.o build/painter.o build/input.o
 
 LIBS     := base
 
