@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: Apache-2.0
  *
- * event_adapter.cc — thin C++ 'Event' session adapter (G1).
+ * event_adapter.cc — thin C++ 'Event' session adapter (G2).
  *
- * See event_adapter.h for the contract. The event dataspace is real
- * for eager clients; submitted events are dropped with an explicit
- * warning because event injection is not implemented before G2. No
- * delivery is ever claimed.
+ * See event_adapter.h for the contract. Submitted batches are clamped
+ * to the event dataspace capacity and routed through the shared
+ * 'Input_pipeline' exactly like driver-side input: real per-session
+ * delivery, no drop, no delivery claim beyond what happened.
  */
 
 #include "event_adapter.h"
@@ -17,26 +17,27 @@
 
 Event_session_component::Event_session_component(
 	Genode::Env     &env,
-	Genode::uint8_t *state,
-	Genode::uint64_t state_size,
+	Sponge::Input_pipeline &pipeline,
 	Resources const &resources,
 	Label     const &label)
 :
 	Genode::Session_object<Event::Session, Event_session_component>(
 		env.ep(), resources, label),
 	_env(env),
-	_state(state), _state_size(state_size),
+	_pipeline(pipeline),
 	_ram(env.ram(), _ram_quota_guard(), _cap_quota_guard()),
 	_ds(_ram, env.rm(), EVENT_DS_SIZE)
 {
-	if (!_state_usable()) {
-		Genode::warning("not implemented: Event session without a usable "
-		                "scene state block (state_size=", state_size,
-		                "); submitted events cannot reach the scene");
+	Genode::uint8_t *const state = _pipeline.state();
+
+	if (!state ||
+	    _pipeline.state_size() < (Genode::uint64_t)SC_SCENE_STORAGE_BYTES) {
+		Genode::warning("Event session without a usable scene state block; "
+		                "submitted events cannot reach the scene");
 		return;
 	}
 
-	_mojo_handle = sc_session_open(_state, SC_SESSION_EVENT);
+	_mojo_handle = sc_session_open(state, SC_SESSION_EVENT);
 
 	if (_mojo_handle < 0) {
 		Genode::warning("sc_session_open(SC_SESSION_EVENT) failed (",
@@ -54,10 +55,17 @@ Event_session_component::~Event_session_component()
 
 void Event_session_component::_close_mojo_session()
 {
-	if (_mojo_handle < 0 || !_state_usable())
+	if (_mojo_handle < 0)
 		return;
 
-	Genode::int32_t const rc = sc_session_close(_state, _mojo_handle);
+	Genode::uint8_t *const state = _pipeline.state();
+
+	if (!state) {
+		_mojo_handle = -1;
+		return;
+	}
+
+	Genode::int32_t const rc = sc_session_close(state, _mojo_handle);
 
 	if (rc != 0)
 		Genode::warning("sc_session_close failed (", rc, ")");
@@ -75,12 +83,24 @@ Genode::Dataspace_capability Event_session_component::dataspace()
 void Event_session_component::submit_batch(unsigned const count)
 {
 	/*
-	 * G1 delivers no input. The events are dropped and delivery is
-	 * not claimed: the RPC cannot report failure, so this warning is
-	 * the only honest signal that the batch never reached any view.
+	 * The batch lives in the shared event dataspace, so the count is
+	 * clamped to what the dataspace can actually hold. Every event
+	 * within that bound reaches the input pipeline (the same path as
+	 * driver-side input) - nothing is dropped.
 	 */
-	Genode::warning("not implemented before G2: Event input injection "
-	                "(dropped ", count, " event(s); no delivery)");
+	unsigned const capacity =
+		EVENT_DS_SIZE / (unsigned)sizeof(Input::Event);
+
+	unsigned const n = (count < capacity) ? count : capacity;
+
+	if (n < count)
+		Genode::warning("Event submit_batch: clamped ", count,
+		                " event(s) to the dataspace capacity (", n, ")");
+
+	if (n == 0)
+		return;
+
+	_pipeline.submit_batch(_ds.local_addr<Input::Event>(), n);
 }
 
 
@@ -90,18 +110,16 @@ void Event_session_component::submit_batch(unsigned const count)
 
 Event_root::Event_root(Genode::Env     &env,
                        Genode::Heap    &heap,
-                       Genode::uint8_t *state,
-                       Genode::uint64_t state_size)
+                       Sponge::Input_pipeline &pipeline)
 :
 	Genode::Root_component<Event_session_component>(env.ep(), heap),
 	_env(env),
-	_state(state), _state_size(state_size)
+	_pipeline(pipeline)
 {
-	if (_state == nullptr ||
-	    _state_size < (Genode::uint64_t)SC_SCENE_STORAGE_BYTES)
-		Genode::warning("event_adapter: invalid scene state block "
-		                "(state_size=", state_size,
-		                "); Event sessions cannot reach the scene");
+	if (pipeline.state() == nullptr ||
+	    pipeline.state_size() < (Genode::uint64_t)SC_SCENE_STORAGE_BYTES)
+		Genode::warning("event_adapter: invalid scene state block; "
+		                "Event sessions cannot reach the scene");
 }
 
 
@@ -115,7 +133,7 @@ Event_root::Create_result
 Event_root::_create_session(const char *args, Genode::Affinity const &)
 {
 	return *new (md_alloc())
-		Event_session_component(_env, _state, _state_size,
+		Event_session_component(_env, _pipeline,
 		                        Genode::session_resources_from_args(args),
 		                        Genode::session_label_from_args(args));
 }

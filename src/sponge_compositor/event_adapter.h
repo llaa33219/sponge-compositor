@@ -1,26 +1,29 @@
 /* SPDX-License-Identifier: Apache-2.0
  *
- * event_adapter.h — thin C++ 'Event' session adapter (G1).
+ * event_adapter.h — thin C++ 'Event' session adapter (G2).
  *
  * Serves the public 'Event::Session' interface over the Mojo-owned
  * compositor core through the C ABI of 'abi.h'. Each session owns a
  * real 4096-byte event dataspace (the size used by the established
- * public Event servers) so eager clients can attach and batch events
- * today. Event injection into the scene is not implemented before G2:
- * 'submit_batch' logs an explicit
- * 'Genode::warning("not implemented before G2: ...")' and drops the
- * batch without claiming delivery. There is no C++ input or scene
- * model here (D16C.10) and no private nitpicker surface (D16C.7).
+ * public Event servers) so eager clients can attach and batch events.
+ *
+ * Submitted batches are real input: 'submit_batch' clamps the count to
+ * the dataspace capacity (the buffer cannot hold more) and forwards the
+ * events to the shared 'Input_pipeline' (input_pipeline.h), which
+ * reduces them through the Mojo core and delivers the results to the
+ * per-session Input queues - the same path as driver-side input. No
+ * batch is dropped and no delivery is claimed that did not happen.
+ * There is no C++ input or scene model here (D16C.10) and no private
+ * nitpicker surface (D16C.7).
  *
  * Integration contract (Gui/main): 'Event_root' is constructed as
  *
- *   Event_root(Genode::Env &, Genode::Heap &,
- *              Genode::uint8_t *state, Genode::uint64_t state_size)
+ *   Event_root(Genode::Env &, Genode::Heap &, Input_pipeline &)
  *
- * with the shared Mojo scene-state block that 'sc_scene_init' was
- * called on (see 'abi.h'), followed by 'announce()'. Each Event
- * session opens an SC_SESSION_EVENT Mojo session and closes it at
- * destruction.
+ * with the pipeline that holds the shared Mojo scene-state block
+ * 'sc_scene_init' was called on (see 'abi.h'), followed by 'announce()'.
+ * Each Event session opens an SC_SESSION_EVENT Mojo session and closes
+ * it at destruction.
  */
 
 #pragma once
@@ -34,7 +37,7 @@
 #include <root/component.h>
 
 /* local includes */
-#include "abi.h"
+#include "input_pipeline.h"
 
 
 /*
@@ -61,11 +64,11 @@ class Event_session_component
 		Genode::Env &_env;
 
 		/*
-		 * Shared Mojo scene-state block (first argument of every ABI
-		 * call). Opaque to C++ (abi.h state-storage contract).
+		 * Shared input pipeline (owns the Mojo scene-state block; the
+		 * state stays opaque to C++ per the abi.h state-storage
+		 * contract).
 		 */
-		Genode::uint8_t  *_state      { nullptr };
-		Genode::uint64_t  _state_size { 0 };
+		Sponge::Input_pipeline &_pipeline;
 
 		/* Mojo session handle from 'sc_session_open', -1 when absent */
 		Genode::int32_t _mojo_handle { -1 };
@@ -75,19 +78,12 @@ class Event_session_component
 
 		Genode::Attached_ram_dataspace _ds;
 
-		bool _state_usable() const
-		{
-			return _state != nullptr
-			    && _state_size >= (Genode::uint64_t)SC_SCENE_STORAGE_BYTES;
-		}
-
 		void _close_mojo_session();
 
 	public:
 
 		Event_session_component(Genode::Env     &env,
-		                        Genode::uint8_t *state,
-		                        Genode::uint64_t state_size,
+		                        Sponge::Input_pipeline &pipeline,
 		                        Resources const &resources,
 		                        Label     const &label);
 
@@ -116,8 +112,7 @@ struct Event_root : Genode::Root_component<Event_session_component>
 
 		Genode::Env &_env;
 
-		Genode::uint8_t  *_state      { nullptr };
-		Genode::uint64_t  _state_size { 0 };
+		Sponge::Input_pipeline &_pipeline;
 
 	protected:
 
@@ -133,8 +128,7 @@ struct Event_root : Genode::Root_component<Event_session_component>
 
 		Event_root(Genode::Env     &env,
 		           Genode::Heap    &heap,
-		           Genode::uint8_t *state,
-		           Genode::uint64_t state_size);
+		           Sponge::Input_pipeline &pipeline);
 
 		Event_root(Event_root const &) = delete;
 		Event_root &operator=(Event_root const &) = delete;
