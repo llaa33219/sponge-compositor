@@ -14,11 +14,11 @@
  *   refresh()    adds damage: the refreshed region enters the scene's
  *                pending damage through the public ABI (sc_damage_add)
  *
- * The pixel dataspace base and row pitch are handed to the Mojo-owned
- * scene through 'sc_view_bind_pixels' by the Gui session adapter
- * (gui_adapter.cc) on every buffer call and on every view creation.
- * C++ owns only the dataspace and the session glue; it does not model
- * or inspect the scene (abi.h, D16C.10).
+ * The pixel, alpha, and input-mask planes of the dataspace are handed
+ * to the Mojo-owned scene through 'sc_view_bind_surfaces' by the Gui
+ * session adapter (gui_adapter.cc) on every buffer call and on every
+ * view creation. C++ owns only the dataspace and the session glue; it
+ * does not model or inspect the scene (abi.h, D16C.10).
  *
  * The remaining Framebuffer RPCs (blit, panning, mode_sigh, sync_sigh,
  * sync_source) degrade to explicit warnings and safe no-op results
@@ -50,8 +50,9 @@ struct Fb_session : Genode::Session_object<Framebuffer::Session>
 		 * Real pixel dataspace of the client buffer. The pixel layer
 		 * is 4 bytes per pixel ('Pixel_rgb888'); a client may request
 		 * 'alpha', which appends alpha and input-mask layers after the
-		 * pixel layer ('Framebuffer::Mode::num_bytes'). Only the
-		 * 4-byte pixel layer is bound to the scene at G1.
+		 * pixel layer ('Framebuffer::Mode'). The plane bases are
+		 * exposed via 'pixels', 'alpha', and 'input_mask'; the
+		 * allocation always covers the full 'mode.num_bytes()'.
 		 */
 		Genode::Constructible<Genode::Attached_ram_dataspace> _ds { };
 
@@ -100,6 +101,28 @@ struct Fb_session : Genode::Session_object<Framebuffer::Session>
 		 * or 0 before the first successful 'define_buffer'
 		 */
 		Genode::int32_t pitch() const;
+
+		/**
+		 * Base of the 1-byte alpha plane of an 'alpha' buffer
+		 * ('base + area.count() * 4' in the 'Framebuffer::Mode'
+		 * layout), or nullptr when the current buffer is not an
+		 * 'alpha' buffer
+		 */
+		Genode::uint8_t const *alpha() const;
+
+		/**
+		 * Base of the 1-byte input-mask plane of an 'alpha' buffer
+		 * (the alpha plane plus 'area.count()' bytes), or nullptr
+		 * when the current buffer is not an 'alpha' buffer
+		 */
+		Genode::uint8_t const *input_mask() const;
+
+		/**
+		 * Row pitch of the alpha and input-mask planes in bytes
+		 * ('mode.area.w'), or 0 when the current buffer is not an
+		 * 'alpha' buffer
+		 */
+		Genode::int32_t byte_pitch() const;
 
 
 		/*******************************

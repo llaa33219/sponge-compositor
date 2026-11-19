@@ -64,6 +64,42 @@ Genode::int32_t Fb_session::pitch() const
 }
 
 
+Genode::uint8_t const *Fb_session::alpha() const
+{
+	if (!_ds.constructed() || !_mode.alpha)
+		return nullptr;
+
+	/*
+	 * The alpha plane follows the whole 4-byte pixel layer
+	 * ('Framebuffer::Mode'): base + area.count() * 4.
+	 */
+	return _ds->local_addr<Genode::uint8_t>() + _mode.area.count()*4;
+}
+
+
+Genode::uint8_t const *Fb_session::input_mask() const
+{
+	if (!_ds.constructed() || !_mode.alpha)
+		return nullptr;
+
+	/* the input-mask plane follows the alpha plane */
+	return alpha() + _mode.area.count();
+}
+
+
+Genode::int32_t Fb_session::byte_pitch() const
+{
+	if (!_ds.constructed() || !_mode.alpha)
+		return 0;
+
+	/*
+	 * Row pitch of the 1-byte alpha and input-mask planes: one byte
+	 * per pixel, so the stride is the mode width in bytes.
+	 */
+	return (Genode::int32_t)_mode.area.w;
+}
+
+
 Genode::Dataspace_capability Fb_session::dataspace()
 {
 	if (!_ds.constructed())
