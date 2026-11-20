@@ -267,6 +267,24 @@ Capture_session_component::capture_at(Point pos)
 		return affected;
 	}
 
+	/*
+	 * Idle fast path: no fetched damage and no valid pending rect means
+	 * there is no work. Return an empty result without re-adding pending
+	 * damage, composing, or emitting a sync.
+	 */
+	if (count == 0) {
+		bool pending_valid = false;
+
+		for (unsigned i = 0; i < Affected_rects::NUM_RECTS; i++)
+			if (_pending.rects[i].valid()) {
+				pending_valid = true;
+				break;
+			}
+
+		if (!pending_valid)
+			return affected;
+	}
+
 	for (Genode::int32_t i = 0; i < count; i++) {
 		if (raw[4*i + 2] <= 0 || raw[4*i + 3] <= 0)
 			continue;
