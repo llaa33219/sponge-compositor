@@ -388,6 +388,7 @@ void Input_pipeline::_submit_flattened(Genode::int32_t ev_type,
 {
 	for (;;) {
 
+
 		Genode::int32_t buf[SC_EVENT_TUPLE_INTS * DRAIN_TUPLES] { };
 
 		Genode::int32_t const n = sc_input_step(
@@ -505,6 +506,27 @@ void Input_pipeline::focus_forward(Genode::int32_t session,
 	if (lost)
 		Genode::warning("input_pipeline: ", lost,
 		                " delivery tuple(s) had no registered session");
+}
+
+
+void Input_pipeline::focus_clear()
+{
+	if (!_state_usable())
+		return;
+
+	unsigned lost = 0, unsupported = 0;
+	Genode::int32_t rc = sc_focus_clear(_state);
+
+	if (rc == -2) {
+		_drain_tuples(lost, unsupported);
+		rc = sc_focus_clear(_state);
+	}
+
+	if (rc != 0)
+		Genode::warning("input_pipeline: sc_focus_clear failed (", rc, ")");
+
+	_drain_tuples(lost, unsupported);
+	_update_reports();
 }
 
 

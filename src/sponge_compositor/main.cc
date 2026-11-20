@@ -186,7 +186,7 @@ void Component::construct(Genode::Env &env)
 	gui_root.announce();
 
 	static Capture_root capture_root {
-		env, heap, state, SCENE_STORAGE_BYTES, width, height };
+		env, heap, gui_root, state, SCENE_STORAGE_BYTES, width, height };
 	capture_root.announce();
 
 	static Event_root event_root {

@@ -320,6 +320,7 @@ class Input_pipeline
 		 * leave-before-enter tuples right away.
 		 */
 		void focus_forward(Genode::int32_t session, Genode::uint64_t target);
+		void focus_clear();
 };
 
 

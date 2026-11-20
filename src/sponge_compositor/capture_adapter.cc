@@ -9,6 +9,7 @@
  */
 
 #include "capture_adapter.h"
+#include "gui_adapter.h"
 
 #include <base/exception.h>
 #include <base/signal.h>
@@ -20,6 +21,8 @@
 
 Capture_session_component::Capture_session_component(
 	Genode::Env     &env,
+	Sponge::Gui_root &gui_root,
+	Capture_root &capture_root,
 	Genode::uint8_t *state,
 	Genode::uint64_t state_size,
 	Genode::int32_t  screen_w,
@@ -28,7 +31,7 @@ Capture_session_component::Capture_session_component(
 	Label     const &label)
 :
 	Genode::Session_object<Capture::Session>(env.ep(), resources, label),
-	_env(env),
+	_env(env), _gui_root(gui_root), _capture_root(capture_root),
 	_state(state), _state_size(state_size),
 	_screen_w(screen_w), _screen_h(screen_h),
 	_ram(env.ram(), _ram_quota_guard(), _cap_quota_guard())
@@ -53,6 +56,39 @@ Capture_session_component::Capture_session_component(
 Capture_session_component::~Capture_session_component()
 {
 	_close_mojo_session();
+}
+
+
+void Capture_session_component::_pending_add(Rect const &rect)
+{
+	if (!rect.valid())
+		return;
+
+	for (unsigned i = 0; i < Affected_rects::NUM_RECTS; i++) {
+		if (!_pending.rects[i].valid()) {
+			_pending.rects[i] = rect;
+			return;
+		}
+	}
+
+	Genode::int32_t x1 = rect.x1(), y1 = rect.y1();
+	Genode::int32_t x2 = rect.x2(), y2 = rect.y2();
+
+	for (unsigned i = 0; i < Affected_rects::NUM_RECTS; i++) {
+		Rect const &current = _pending.rects[i];
+		if (!current.valid())
+			continue;
+		if (current.x1() < x1) x1 = current.x1();
+		if (current.y1() < y1) y1 = current.y1();
+		if (current.x2() > x2) x2 = current.x2();
+		if (current.y2() > y2) y2 = current.y2();
+	}
+
+	_pending.rects[0] = Rect {
+		Point { x1, y1 },
+		Area  { (unsigned)(x2 - x1), (unsigned)(y2 - y1) } };
+	for (unsigned i = 1; i < Affected_rects::NUM_RECTS; i++)
+		_pending.rects[i] = Rect { };
 }
 
 
@@ -219,18 +255,33 @@ Capture_session_component::capture_at(Point pos)
 {
 	Affected_rects affected { };
 
-	if (!_buffer.constructed())
+	if (!_buffer.constructed() || !_state_usable())
 		return affected;
 
-	if (!_state_usable())
-		return affected;
+	Genode::int32_t raw[Affected_rects::NUM_RECTS * 4] { };
+	Genode::int32_t const count =
+		sc_damage_fetch(_state, raw, (Genode::int32_t)Affected_rects::NUM_RECTS);
 
-	/*
-	 * Buffer coordinate of the screen origin per the public Capture
-	 * contract ('pos' shows at the top-left corner of the client's
-	 * viewport). Identity for the G1 shape (pos = (0, 0), full-buffer
-	 * viewport).
-	 */
+	if (count < 0) {
+		Genode::warning("sc_damage_fetch failed (", count, ")");
+		return affected;
+	}
+
+	for (Genode::int32_t i = 0; i < count; i++) {
+		if (raw[4*i + 2] <= 0 || raw[4*i + 3] <= 0)
+			continue;
+		_capture_root._add_pending(Rect {
+			Point { raw[4*i + 0], raw[4*i + 1] },
+			Area  { (unsigned)raw[4*i + 2], (unsigned)raw[4*i + 3] } });
+	}
+
+	for (unsigned i = 0; i < Affected_rects::NUM_RECTS; i++) {
+		Rect const &r = _pending.rects[i];
+		if (r.valid())
+			sc_damage_add(_state, r.x1(), r.y1(), r.w(), r.h());
+	}
+
+	/* Buffer coordinate of the screen origin per the public Capture contract. */
 	Point const anchor = pos - _buffer_attr.clipped_viewport().at;
 
 	if (anchor != Point { 0, 0 } && !_warned_anchor) {
@@ -254,56 +305,29 @@ Capture_session_component::capture_at(Point pos)
 		return affected;
 	}
 
-	/*
-	 * Report what 'sc_compose' just painted: fetching the damage
-	 * clears it ('sc_damage_fetch' is the only way to read it). With
-	 * more than one concurrent Capture session the first capture
-	 * consumes the shared damage list; concurrent multi-capture is a
-	 * G2 concern.
-	 */
-	Genode::int32_t raw[Affected_rects::NUM_RECTS * 4] { };
-
-	Genode::int32_t const count =
-		sc_damage_fetch(_state, raw, (Genode::int32_t)Affected_rects::NUM_RECTS);
-
-	if (count < 0) {
-		Genode::warning("sc_damage_fetch failed (", count, ")");
-		return affected;
-	}
-
 	Rect const buffer_rect { Point { 0, 0 }, _buffer_attr.px };
-
 	unsigned out = 0;
 
-	for (Genode::int32_t i = 0;
-	     i < count && i < (Genode::int32_t)Affected_rects::NUM_RECTS &&
-	     out < Affected_rects::NUM_RECTS; i++) {
+	for (unsigned i = 0;
+	     i < Affected_rects::NUM_RECTS && out < Affected_rects::NUM_RECTS;
+	     i++) {
 
-		Genode::int32_t const x = raw[4*i + 0];
-		Genode::int32_t const y = raw[4*i + 1];
-		Genode::int32_t const w = raw[4*i + 2];
-		Genode::int32_t const h = raw[4*i + 3];
-
-		if (w <= 0 || h <= 0)
-			continue;
-
-		Rect const screen_rect {
-			Point { x, y }, Area { (unsigned)w, (unsigned)h } };
-
+		Rect const &screen_rect = _pending.rects[i];
 		if (!screen_rect.valid())
 			continue;
 
-		/* screen coordinates -> buffer coordinates */
-		Rect const translated {
-			screen_rect.p1() - anchor, screen_rect.area };
-
-		Rect const clipped =
-			Rect::intersect(translated, buffer_rect);
+		Rect const translated { screen_rect.p1() - anchor, screen_rect.area };
+		Rect const clipped = Rect::intersect(translated, buffer_rect);
 
 		if (clipped.valid())
 			affected.rects[out++] = clipped;
 	}
 
+	/* Sync only after real composition; idle polls must not broadcast. */
+	if (out > 0)
+		_gui_root.submit_sync();
+
+	_pending = Affected_rects { };
 	return affected;
 }
 
@@ -326,13 +350,14 @@ void Capture_session_component::capture_stopped()
 
 Capture_root::Capture_root(Genode::Env     &env,
                            Genode::Heap    &heap,
+                           Sponge::Gui_root &gui_root,
                            Genode::uint8_t *state,
                            Genode::uint64_t state_size,
                            Genode::int32_t  screen_w,
                            Genode::int32_t  screen_h)
 :
 	Genode::Root_component<Capture_session_component>(env.ep(), heap),
-	_env(env),
+	_env(env), _gui_root(gui_root),
 	_state(state), _state_size(state_size),
 	_screen_w(screen_w > 0 ? screen_w : DEFAULT_SCREEN_W),
 	_screen_h(screen_h > 0 ? screen_h : DEFAULT_SCREEN_H)
@@ -356,14 +381,31 @@ void Capture_root::announce()
 }
 
 
+void Capture_root::_add_pending(Rect const &rect)
+{
+	for (unsigned i = 0; i < SC_MAX_SESSIONS; i++)
+		if (_sessions[i])
+			_sessions[i]->add_pending(rect);
+}
+
+
 Capture_root::Create_result
 Capture_root::_create_session(const char *args, Genode::Affinity const &)
 {
-	return *new (md_alloc())
-		Capture_session_component(_env, _state, _state_size,
+	Capture_session_component *session = new (md_alloc())
+		Capture_session_component(_env, _gui_root, *this, _state, _state_size,
 		                          _screen_w, _screen_h,
 		                          Genode::session_resources_from_args(args),
 		                          Genode::session_label_from_args(args));
+
+	for (unsigned i = 0; i < SC_MAX_SESSIONS; i++) {
+		if (!_sessions[i]) {
+			_sessions[i] = session;
+			break;
+		}
+	}
+
+	return *session;
 }
 
 
@@ -377,5 +419,9 @@ void Capture_root::_upgrade_session(Capture_session_component &session,
 
 void Capture_root::_destroy_session(Capture_session_component &session)
 {
+	for (unsigned i = 0; i < SC_MAX_SESSIONS; i++)
+		if (_sessions[i] == &session)
+			_sessions[i] = nullptr;
+
 	Genode::destroy(md_alloc(), &session);
 }

@@ -40,6 +40,10 @@
 #include "abi.h"
 
 
+namespace Sponge { struct Gui_root; }
+struct Capture_root;
+
+
 class Capture_session_component : public Genode::Session_object<Capture::Session>
 {
 	public:
@@ -54,6 +58,8 @@ class Capture_session_component : public Genode::Session_object<Capture::Session
 	private:
 
 		Genode::Env &_env;
+		Sponge::Gui_root &_gui_root;
+		Capture_root &_capture_root;
 
 		/*
 		 * Shared Mojo scene-state block (first argument of every ABI
@@ -79,6 +85,8 @@ class Capture_session_component : public Genode::Session_object<Capture::Session
 		Genode::Signal_context_capability _screen_size_sigh { };
 		Genode::Signal_context_capability _wakeup_sigh      { };
 
+		Affected_rects _pending { };
+
 		bool _stopped { false };
 
 		/* warn at most once per session about the non-origin corner */
@@ -100,6 +108,7 @@ class Capture_session_component : public Genode::Session_object<Capture::Session
 		 * as "no damage".
 		 */
 		bool _damage_pending();
+		void _pending_add(Rect const &rect);
 
 		void _wakeup_if_needed();
 
@@ -108,6 +117,8 @@ class Capture_session_component : public Genode::Session_object<Capture::Session
 	public:
 
 		Capture_session_component(Genode::Env     &env,
+		                          Sponge::Gui_root &gui_root,
+		                          Capture_root &capture_root,
 		                          Genode::uint8_t *state,
 		                          Genode::uint64_t state_size,
 		                          Genode::int32_t  screen_w,
@@ -137,6 +148,8 @@ class Capture_session_component : public Genode::Session_object<Capture::Session
 
 		Affected_rects capture_at(Point pos) override;
 
+		void add_pending(Rect const &rect) { _pending_add(rect); }
+
 		void capture_stopped() override;
 };
 
@@ -146,6 +159,8 @@ class Capture_session_component : public Genode::Session_object<Capture::Session
  */
 struct Capture_root : Genode::Root_component<Capture_session_component>
 {
+	using Rect = Capture::Rect;
+
 	/**
 	 * G1 default screen size (run/compositor.inc configures
 	 * 'width: 1024 | height: 768'); used when the supplied screen
@@ -159,12 +174,15 @@ struct Capture_root : Genode::Root_component<Capture_session_component>
 	private:
 
 		Genode::Env &_env;
+		Sponge::Gui_root &_gui_root;
 
 		Genode::uint8_t  *_state      { nullptr };
 		Genode::uint64_t  _state_size { 0 };
 
 		Genode::int32_t _screen_w { DEFAULT_SCREEN_W };
 		Genode::int32_t _screen_h { DEFAULT_SCREEN_H };
+
+		Capture_session_component *_sessions[SC_MAX_SESSIONS] { };
 
 	protected:
 
@@ -180,6 +198,7 @@ struct Capture_root : Genode::Root_component<Capture_session_component>
 
 		Capture_root(Genode::Env     &env,
 		             Genode::Heap    &heap,
+		             Sponge::Gui_root &gui_root,
 		             Genode::uint8_t *state,
 		             Genode::uint64_t state_size,
 		             Genode::int32_t  screen_w,
@@ -189,4 +208,5 @@ struct Capture_root : Genode::Root_component<Capture_session_component>
 		Capture_root &operator=(Capture_root const &) = delete;
 
 		void announce();
+		void _add_pending(Rect const &rect);
 };
