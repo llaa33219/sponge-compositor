@@ -16,7 +16,9 @@
  *   focus()       focus forwarding through the input pipeline
  *                 ('Input_pipeline::focus_forward' -> sc_focus_forward)
  *   info()        real 'Dynamic_rom_session' with the root 'panorama'
- *                 node (xpos/ypos/width/height) plus a capture sub-node
+ *                 node (xpos/ypos/width/height) plus a capture sub-node,
+ *                 both reporting the session's domain rect (the
+ *                 '<domain>'/'<policy>' config surface below)
  *
  * Input integration (G2): each session owns a real per-session
  * 'Input::Session_component' (input_adapter.h) and registers it with
@@ -71,6 +73,20 @@
 namespace Sponge {
 
 
+/*
+ * A session's domain rectangle: the panorama/capture rect reported by
+ * 'Gui_session_component::Info_rom'. 'Gui_root' resolves it from the
+ * public '<domain>'/'<policy>'/'<default-policy>' config at session
+ * creation, with the width/height alignment semantics of upstream
+ * nitpicker's 'Domain_registry::Entry::screen_rect' (see
+ * 'Gui_root::_domain_rect_for').
+ */
+struct Domain_rect
+{
+	Genode::int32_t x { 0 }, y { 0 }, w { 0 }, h { 0 };
+};
+
+
 class Gui_session_component : public Genode::Session_object<Gui::Session>
 {
 	private:
@@ -79,8 +95,7 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 		Genode::uint8_t   *const _state;    /* Mojo scene state block */
 		Input_pipeline    &_pipeline;       /* input routing seam (G2) */
 		Genode::int32_t    const _handle;   /* scene session handle   */
-		Genode::int32_t    const _screen_w; /* info-ROM panorama      */
-		Genode::int32_t    const _screen_h;
+		Domain_rect        const _domain_rect; /* info-ROM panorama   */
 
 		/*
 		 * Active view ids of this session (client-chosen 'View_id'
@@ -110,8 +125,8 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 
 		/*
 		 * The 'Gui::Session::info' ROM. Root node 'panorama' with the
-		 * xpos/ypos/width/height attributes of the screen plus one
-		 * 'capture' sub-node (the captured screen area).
+		 * xpos/ypos/width/height attributes of the session's domain
+		 * rect plus one 'capture' sub-node (the captured screen area).
 		 */
 		struct Info_rom : Genode::Dynamic_rom_session::Xml_producer,
 		                  Genode::Dynamic_rom_session
@@ -166,8 +181,9 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 		 * \param resources     client-donated session resources
 		 * \param label         client session label (feeds the input
 		 *                      pipeline's hover report)
-		 * \param screen_w      screen width for the info ROM
-		 * \param screen_h      screen height for the info ROM
+		 * \param domain_rect   session domain rect for the info ROM,
+		 *                      resolved by 'Gui_root' from the
+		 *                      '<domain>'/'<policy>' config
 		 */
 		Gui_session_component(Genode::Env                  &env,
 		                      Genode::uint8_t              *state,
@@ -175,8 +191,7 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 		                      Genode::int32_t               scene_handle,
 		                      Genode::Session::Resources    const &resources,
 		                      Genode::Session::Label        const &label,
-		                      Genode::int32_t               screen_w,
-		                      Genode::int32_t               screen_h);
+		                      Domain_rect             const &domain_rect);
 
 		~Gui_session_component();
 
@@ -201,6 +216,7 @@ class Gui_session_component : public Genode::Session_object<Gui::Session>
 		void                 execute() override;
 		Buffer_result        buffer(Framebuffer::Mode) override;
 		void                 focus(Gui::Session_capability) override;
+		void                 submit_sync();
 };
 
 
@@ -218,6 +234,91 @@ struct Gui_root : Genode::Root_component<Gui_session_component>
 		Input_pipeline      &_pipeline;
 		Genode::int32_t      const _screen_w;
 		Genode::int32_t      const _screen_h;
+
+		/*
+		 * Fixed-capacity domain and policy tables parsed from the
+		 * native config (the public '<domain>', '<policy>', and
+		 * '<default-policy>' surface of upstream nitpicker, reduced
+		 * to what the info-ROM panorama rect needs: no layering,
+		 * hover, focus, color, content, or label-visibility state).
+		 * Plain member arrays only: no heap and no second scene
+		 * model. Overflow and malformed entries drop with loud
+		 * warnings.
+		 */
+		enum { MAX_DOMAINS = 8, MAX_POLICIES = 8 };
+
+		struct Domain
+		{
+			/* upstream 'Domain_registry::Entry::Origin' values */
+			enum class Origin { TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT,
+			                    BOTTOM_RIGHT, POINTER };
+
+			using Name = Genode::String<64>;
+
+			bool   used   { false };
+			Name   name   { };
+
+			/*
+			 * Parsed and kept for config fidelity with upstream;
+			 * 'screen_rect' (the info-ROM panorama rect) is
+			 * origin-independent exactly like upstream, and the
+			 * origin-dependent coordinate translation
+			 * ('Domain_registry::Entry::phys_pos') is not part of
+			 * the info ROM.
+			 */
+			Origin origin { Origin::TOP_LEFT };
+
+			/* raw attributes, see '_domain_rect_for' */
+			Genode::int32_t xpos   { 0 };
+			Genode::int32_t ypos   { 0 };
+			Genode::int32_t width  { 0 };
+			Genode::int32_t height { 0 };
+		};
+
+		struct Policy
+		{
+			using Selector = Genode::String<160>;
+
+			bool used { false };
+
+			/*
+			 * Selector attributes ('label' exact, 'label_prefix'
+			 * starts-with, 'label_last' equals the label's last
+			 * element). Every present selector must match (upstream
+			 * 'Node_label_score' conflict semantics).
+			 */
+			bool     has_label        { false };
+			Selector label            { };
+			bool     has_label_prefix { false };
+			Selector label_prefix     { };
+			bool     has_label_last   { false };
+			Selector label_last       { };
+
+			Domain::Name domain { };
+		};
+
+		Domain _domains[MAX_DOMAINS] { };
+		Policy _policies[MAX_POLICIES] { };
+		unsigned _num_domains { 0 };
+		unsigned _num_policies { 0 };
+		bool           _has_default_policy { false };
+		Domain::Name   _default_policy_domain { };
+
+		Domain const *_lookup_domain(Domain::Name const &name) const;
+
+		static Domain::Origin _parse_origin(Genode::Node const &domain);
+
+		void _parse_domains(Genode::Node const &config);
+		void _parse_policies(Genode::Node const &config);
+
+		/*
+		 * Resolve the session's domain rect: exact 'label', then
+		 * 'label_prefix', then 'label_last', then '<default-policy>',
+		 * else the full screen.
+		 */
+		Domain_rect _domain_rect_for(Genode::Session::Label const &label) const;
+
+		Gui_session_component *_sessions[SC_MAX_SESSIONS] { };
 
 	protected:
 
@@ -244,7 +345,10 @@ struct Gui_root : Genode::Root_component<Gui_session_component>
 		 *                   (the session-scoped sc_* calls take the
 		 *                   state pointer only)
 		 * \param config     native config node ('width'/'height'
-		 *                   attributes feed the info-ROM panorama)
+		 *                   attributes feed the info-ROM panorama;
+		 *                   '<domain>'/'<policy>'/'<default-policy>'
+		 *                   sub-nodes feed the per-session domain
+		 *                   rects)
 		 * \param pipeline   shared input pipeline handed to every
 		 *                   session (input registration and focus
 		 *                   forwarding)
@@ -258,6 +362,7 @@ struct Gui_root : Genode::Root_component<Gui_session_component>
 		 * Announce the 'Gui' root to the parent
 		 */
 		void announce();
+		void submit_sync();
 };
 
 
