@@ -17,7 +17,7 @@ move/resize/focus/close/minimize/maximize/tiling battery and the
 >=20-cycle rules-drift soak with the Sponge WM trio and DE tasklist
 above the native compositor: native QMP 16-step, tasks, and full
 20-cycle tiling with close and reflow all PASS. One recorded tiling run
-failed at close while two later runs passed; that intermittent
+failed at close while multiple later runs passed; that intermittent
 close-time input failure is documented (see Verification) and is never
 relabeled, so the status is G1-G3 verified with a documented
 intermittent close-time input failure, not a claim of perfect
@@ -35,10 +35,11 @@ across view recreation; bind-time texture extents add an in-extent fast
 path and safe tiling; the per-session domain Info_rom reports the
 session's domain (panel 1024x28 versus the full-screen default);
 damage is distributed per Capture session with sync only on nonempty
-damage; DE static rules convert to boundary-relative coordinates; and
-the tiling scenario closes through the absolute-tablet path (W4 scale
-transform, one-marker host dispatch) with a conditional
-restore-before-close.
+damage and an idle composition fast return; DE static rules convert to
+boundary-relative coordinates; and the tiling scenario restores either
+parked window, focuses the master title, enforces pointer barriers,
+recomputes close geometry after focus, and dispatches four absolute-tablet
+markers through the W4 scale transform.
 
 ## Architecture
 
@@ -123,16 +124,15 @@ Runs the QMP, tasks, and tiling arms in three sequential boots with
 `tier0_kind=native`. Receipts: native QMP full 16-step PASS
 (`/tmp/opencode/g3-c16-qmp-final4.log`), native tasks PASS
 (`/tmp/opencode/g3-c16-tasks-fixed.log`), native full 20-cycle tiling
-PASS with close and reflow PASS
-(`/tmp/opencode/g3-c16-tiling-final3.log`); the upstream QMP and tasks
-anchors pass (`/tmp/opencode/g3-upstream-qmp.log`,
+PASS with close and reflow PASS on the cleaned tree
+(`/tmp/opencode/g3-c16-tiling-final-verified.log`); the upstream QMP and
+tasks anchors pass (`/tmp/opencode/g3-upstream-qmp.log`,
 `/tmp/opencode/g3-upstream-tasks.log`) and upstream tiling is not
 claimed. Intermittent close-time input failure (explicit): one recorded
 tiling run failed at close (`/tmp/opencode/g3-c16-tiling-final2.log`,
-the master close did not destroy its window) while
-`/tmp/opencode/g3-c16-tiling-final3.log` and
-`/tmp/opencode/g3-c16-tiling-restoretablet2.log` passed the same close
-and reflow gates. The failure is documented, never relabeled. Host
+the master close did not destroy its window) while `final3`,
+`restoretablet2`, `final-fixed3`, and `final-verified` logs passed the
+same close and reflow gates. The failure is documented, never relabeled. Host
 receiver and guard-page repros pass (the receiver repro covers input
 across view recreation; the guard-page repro proves compose never reads
 past the bound buffer).
