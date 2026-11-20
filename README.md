@@ -2,18 +2,43 @@
 
 Native Mojo-first compositor for Sponge OS.
 
-## Status: G2 input verified
+## Status: G1-G3 verified with documented intermittent close-time input failure
 
 The repository implements the G1 vertical slice (two opaque views,
-stacking, clipping/damage, and a real Capture consumer) plus the G2 input
-battery on seL4 QEMU. G1 rasters match upstream nitpicker byte-for-byte.
-G2 delivers real QMP clicks, alpha/input-mask fall-through, focus
-transitions, deterministic Event injection, and pointer-report validation
-through the public Genode surface. Tier-0 selection is default-native:
-unset or `SPONGE_COMPOSITOR=native` runs `sponge_compositor`, and
+stacking, clipping/damage, and a real Capture consumer), the G2 input
+battery, and the G3 Criterion-16 battery on seL4 QEMU. G1 rasters match
+upstream nitpicker byte-for-byte (`g1-diff: MATCH`, checksum
+`0x670d6b5d9fc0ed7b`). G2 delivers real QMP clicks, alpha/input-mask
+fall-through, focus transitions, deterministic Event injection, and
+pointer-report validation through the public Genode surface; the exact
+Event-injection differential matches on both Tier-0s
+(`trace-inject` `0xc50006d9e1676755`). G3 runs the full
+move/resize/focus/close/minimize/maximize/tiling battery and the
+>=20-cycle rules-drift soak with the Sponge WM trio and DE tasklist
+above the native compositor: native QMP 16-step, tasks, and full
+20-cycle tiling with close and reflow all PASS. One recorded tiling run
+failed at close while two later runs passed; that intermittent
+close-time input failure is documented (see Verification) and is never
+relabeled, so the status is G1-G3 verified with a documented
+intermittent close-time input failure, not a claim of perfect
+stability. Alpha blending and WM/DE integration are proven on seL4
+QEMU; G4-G5, product integration, and physical-hardware validation
+remain uncompleted. Tier-0 selection is default-native: unset or
+`SPONGE_COMPOSITOR=native` runs `sponge_compositor`, and
 `SPONGE_COMPOSITOR=upstream` runs the explicit nitpicker fallback
-(any other value fails loudly). The user approved the native default on
-2026-11-19, after the green G2 receipts.
+(any other value fails loudly); both paths work. The user approved the
+native default on 2026-11-19, after the green G2 receipts.
+
+The G3 functional changes are correctness fixes, not changes to the
+acceptance assertions: per-session `pressed_session` preserves input
+across view recreation; bind-time texture extents add an in-extent fast
+path and safe tiling; the per-session domain Info_rom reports the
+session's domain (panel 1024x28 versus the full-screen default);
+damage is distributed per Capture session with sync only on nonempty
+damage; DE static rules convert to boundary-relative coordinates; and
+the tiling scenario closes through the absolute-tablet path (W4 scale
+transform, one-marker host dispatch) with a conditional
+restore-before-close.
 
 ## Architecture
 
@@ -34,7 +59,9 @@ unset or `SPONGE_COMPOSITOR=native` runs `sponge_compositor`, and
   scene, painter, and input objects have empty `nm -u`.
 
 WM and DE are independent: they use the same public Genode interfaces and
-are not included in the G1/G2 scenarios.
+are not included in the G1/G2 scenarios. The G3 battery runs the Sponge
+WM trio and DE tasklist above the compositor through those same
+interfaces (WM/DE integration proven on seL4 QEMU).
 
 ## Build
 
@@ -86,16 +113,41 @@ otherwise identical records. That divergence is enumerated and allowed
 under plan section 8.2; it is not hidden and is not a reason to synthesize
 center hover in native.
 
+G3 (Criterion-16 battery):
+
+```bash
+make -C <build-dir> run/sponge-compositor-c16 KERNEL=sel4 BOARD=pc
+```
+
+Runs the QMP, tasks, and tiling arms in three sequential boots with
+`tier0_kind=native`. Receipts: native QMP full 16-step PASS
+(`/tmp/opencode/g3-c16-qmp-final4.log`), native tasks PASS
+(`/tmp/opencode/g3-c16-tasks-fixed.log`), native full 20-cycle tiling
+PASS with close and reflow PASS
+(`/tmp/opencode/g3-c16-tiling-final3.log`); the upstream QMP and tasks
+anchors pass (`/tmp/opencode/g3-upstream-qmp.log`,
+`/tmp/opencode/g3-upstream-tasks.log`) and upstream tiling is not
+claimed. Intermittent close-time input failure (explicit): one recorded
+tiling run failed at close (`/tmp/opencode/g3-c16-tiling-final2.log`,
+the master close did not destroy its window) while
+`/tmp/opencode/g3-c16-tiling-final3.log` and
+`/tmp/opencode/g3-c16-tiling-restoretablet2.log` passed the same close
+and reflow gates. The failure is documented, never relabeled. Host
+receiver and guard-page repros pass (the receiver repro covers input
+across view recreation; the guard-page repro proves compose never reads
+past the bound buffer).
+
 Evidence: `docs/evidence/phase16-compositor-index.md` in the umbrella.
 
-## G2 limits
+## Limits (G1-G3)
 
-Child views/associate, blit/panning, sync notifications, translucent
-blending, keyboard/touch/global-key input, pointer-shape reporting, WM/DE
-integration, GPU acceleration, and physical-hardware validation are outside
-G1/G2 and are not claimed. Alpha input masks are consumed for hit testing
-from G2 on, but blending translucent views is not implemented. Unsupported
-protocol corners warn loudly or return documented safe results. Capacities
-are 8 sessions, 32 views, and 3 merged damage rectangles. Native is the
-default selection; `SPONGE_COMPOSITOR=upstream` keeps the nitpicker
-fallback reachable as an explicit override.
+Child views/associate, blit/panning, sync notifications,
+keyboard/touch/global-key input, and pointer-shape reporting are outside
+G1-G3 and are not claimed. Unsupported protocol corners warn loudly or
+return documented safe results. Alpha blending (straight-alpha
+`blit_alpha`) and WM/DE integration are proven on seL4 QEMU. Capacities
+are 32 sessions, 64 views, and 3 damage rectangles. GPU acceleration,
+product integration (G4-G5), and physical-hardware validation remain
+uncompleted. Native is the default selection;
+`SPONGE_COMPOSITOR=upstream` keeps the nitpicker fallback reachable as
+an explicit override.
