@@ -58,10 +58,12 @@
 # Build seam (plan D16C.4):
 #   mojo build --emit object --relocation-model=pic -o scene.o scene.mojo
 
-from painter import blit_opaque, fill_rect
+from std.sys import size_of
 
-comptime CAP_SESSIONS = 8
-comptime CAP_VIEWS = 32
+from painter import blit_alpha, blit_opaque, fill_rect
+
+comptime CAP_SESSIONS = 32
+comptime CAP_VIEWS = 64
 comptime CAP_DAMAGE = 3
 comptime STORAGE_BYTES = 8192
 
@@ -111,6 +113,17 @@ struct View(Copyable, Movable):
     var off_x: Int32
     var off_y: Int32
     var pitch: Int32
+    # Bind-time texture extent: the bound buffer's own pixel dimensions,
+    # set from the actual buffer at sc_view_bind_pixels /
+    # sc_view_bind_surfaces (never from the view's current geometry) and
+    # initialized to 0 with no buffer bound. Composition and input-mask
+    # sampling floor-mod their source coordinates over this extent (the
+    # upstream nitpicker frozen-size texture tiling), so a view that
+    # outgrows its current buffer (maximize before the new buffer
+    # arrives) wraps instead of reading outside the bound planes. A zero
+    # extent is never sampled.
+    var buf_w: Int32
+    var buf_h: Int32
     var pixels: Optional[UnsafePointer[UInt32, MutUntrackedOrigin]]
     # G2 surface planes (see sc_view_bind_surfaces). The alpha plane makes
     # the view "alpha-enabled" for hit testing; the input-mask plane (byte
@@ -127,9 +140,10 @@ struct Scene_state(Copyable, Movable):
     var screen_w: Int32
     var screen_h: Int32
     var bg: UInt32
-    var sessions: InlineArray[Session, 8]
-    var views: InlineArray[View, 32]
-    var stack: InlineArray[Int32, 32]
+    var sessions: InlineArray[Session, CAP_SESSIONS]
+    var views: InlineArray[View, CAP_VIEWS]
+    var stack: InlineArray[Int32, CAP_VIEWS]
+
     var stack_n: Int32
     var damage: InlineArray[Rect, 3]
     var damage_n: Int32
@@ -139,7 +153,10 @@ struct Scene_state(Copyable, Movable):
     # `buttons` is the held mouse-button bitmask (bit 0 = BTN_LEFT,
     # 1 = BTN_RIGHT, 2 = BTN_MIDDLE); `key_cnt` counts all held keys.
     # `hovered`, `focused`, and `pressed` (the current input receiver)
-    # are view-slot indices or -1. `exclusive` routes relative motion to
+    # are view-slot indices or -1. `pressed_session` is the session
+    # captured when the press sequence started (the session-scoped
+    # receiver fallback of input.mojo's emit_to_pressed; -1 when there
+    # was no active pressed view). `exclusive` routes relative motion to
     # the focused view without moving the pointer (upstream "exclusive
     # input"). `drag` is set once a button-held sequence has seen motion.
     # `seq` is the delivery sequence counter (tuple slot 6). `evq` is the
@@ -151,6 +168,7 @@ struct Scene_state(Copyable, Movable):
     var hovered: Int32
     var focused: Int32
     var pressed: Int32
+    var pressed_session: Int32
     var exclusive: Int32
     var drag: Int32
     var seq: Int32
@@ -159,9 +177,9 @@ struct Scene_state(Copyable, Movable):
     var evq: InlineArray[Int32, 256]
 
 
-# Scene_state fits well under SC_SCENE_STORAGE_BYTES (8 sessions * 8 B +
-# 32 views * 80 B + 32 * 4 B + 3 * 16 B + scalars + 16 * 4 B key bitmap +
-# 256 * 4 B tuple queue ~= 3.9 KiB). C++ allocates the full 8192 bytes;
+# Scene_state fits under SC_SCENE_STORAGE_BYTES (32 sessions * 8 B +
+# 64 views * 96 B + 64 * 4 B + 3 * 16 B + scalars + 16 * 4 B key bitmap +
+# 256 * 4 B tuple queue ~= 7.7 KiB). C++ allocates the full 8192 bytes;
 # the layout above is private to this module.
 
 
@@ -480,6 +498,11 @@ def clear_slot_refs(s: UnsafePointer[Scene_state, MutUntrackedOrigin], slot: Int
         s[0].focused = -1
     if s[0].pressed == slot:
         s[0].pressed = -1
+    # View destruction clears the slot references above but
+    # intentionally preserves `pressed_session`: emit_to_pressed's
+    # session-scoped receiver fallback must survive a decorator view
+    # destroy+recreate (upstream keeps a session-scoped View_owner
+    # receiver). sc_session_close clears it when the session goes away.
 
 
 def drop_queue_for_session(
@@ -518,6 +541,9 @@ def sc_scene_init(
     bg_g: Int32,
     bg_b: Int32,
 ) abi("C") -> Int32:
+    comptime assert (
+        size_of[Scene_state]() <= STORAGE_BYTES
+    ), "Scene_state must fit SC_SCENE_STORAGE_BYTES"
     if is_null_state(state):
         return -1
     if state_size < UInt64(STORAGE_BYTES):
@@ -546,6 +572,7 @@ def sc_scene_init(
     s[0].hovered = -1
     s[0].focused = -1
     s[0].pressed = -1
+    s[0].pressed_session = -1
     s[0].exclusive = 0
     s[0].drag = 0
     s[0].seq = 0
@@ -567,6 +594,8 @@ def sc_scene_init(
         s[0].views[j & (CAP_VIEWS - 1)].off_x = 0
         s[0].views[j & (CAP_VIEWS - 1)].off_y = 0
         s[0].views[j & (CAP_VIEWS - 1)].pitch = 0
+        s[0].views[j & (CAP_VIEWS - 1)].buf_w = 0
+        s[0].views[j & (CAP_VIEWS - 1)].buf_h = 0
         s[0].views[j & (CAP_VIEWS - 1)].pixels = None
         s[0].views[j & (CAP_VIEWS - 1)].alpha = None
         s[0].views[j & (CAP_VIEWS - 1)].alpha_pitch = 0
@@ -625,12 +654,18 @@ def sc_session_close(state: UnsafePointer[UInt8, MutUntrackedOrigin], handle: In
             stack_remove(s, Int32(j))
             s[0].views[j & (CAP_VIEWS - 1)].active = 0
             s[0].views[j & (CAP_VIEWS - 1)].pixels = None
+            s[0].views[j & (CAP_VIEWS - 1)].buf_w = 0
+            s[0].views[j & (CAP_VIEWS - 1)].buf_h = 0
             s[0].views[j & (CAP_VIEWS - 1)].alpha = None
             s[0].views[j & (CAP_VIEWS - 1)].mask = None
             clear_slot_refs(s, Int32(j))
             _ = damage_add_rect(s, v.x, v.y, v.w, v.h)
         j += 1
     s[0].sessions[Int(handle) & (CAP_SESSIONS - 1)].active = 0
+    # The session fallback dies with the session (view destruction
+    # preserves it; closing the session does not).
+    if s[0].pressed_session == handle:
+        s[0].pressed_session = -1
     drop_queue_for_session(s, handle)
     return 0
 
@@ -677,6 +712,8 @@ def sc_view_create(
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].off_x = 0
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].off_y = 0
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pitch = 0
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_w = 0
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_h = 0
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pixels = None
     if front != 0:
         stack_insert_top(s, slot)
@@ -706,6 +743,8 @@ def sc_view_destroy(
     _ = damage_add_rect(s, v.x, v.y, v.w, v.h)
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].active = 0
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pixels = None
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_w = 0
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_h = 0
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha = None
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].mask = None
     clear_slot_refs(s, slot)
@@ -720,6 +759,8 @@ def sc_view_bind_pixels(
     view_id: UInt64,
     pixels: Optional[UnsafePointer[UInt32, MutUntrackedOrigin]],
     pitch: Int32,
+    buf_w: Int32,
+    buf_h: Int32,
 ) abi("C") -> Int32:
     if is_null_state(state):
         return -1
@@ -735,9 +776,15 @@ def sc_view_bind_pixels(
         return -1
     if pitch <= 0 or (pitch & 3) != 0:
         return -1
+    # The extent describes the bound buffer (not the view's geometry)
+    # and must be positive: composition and mask sampling wrap over it.
+    if buf_w <= 0 or buf_h <= 0:
+        return -1
     var px = pixels.value()
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pixels = px
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pitch = pitch
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_w = buf_w
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_h = buf_h
     # Compatibility binding: replaces the whole surface set, so any
     # alpha/input-mask planes from sc_view_bind_surfaces are dropped and
     # the view hit-tests as opaque again.
@@ -758,6 +805,8 @@ def sc_view_bind_surfaces(
     view_id: UInt64,
     pixels: Optional[UnsafePointer[UInt32, MutUntrackedOrigin]],
     pixel_pitch: Int32,
+    buf_w: Int32,
+    buf_h: Int32,
     alpha: Optional[UnsafePointer[UInt8, MutUntrackedOrigin]],
     alpha_pitch: Int32,
     input_mask: Optional[UnsafePointer[UInt8, MutUntrackedOrigin]],
@@ -777,6 +826,11 @@ def sc_view_bind_surfaces(
         return -1
     if pixel_pitch <= 0 or (pixel_pitch & 3) != 0:
         return -1
+    # The extent describes the bound buffer (shared by all planes, not
+    # the view's geometry) and must be positive: composition and mask
+    # sampling wrap over it.
+    if buf_w <= 0 or buf_h <= 0:
+        return -1
     # Optional planes are all-or-nothing: a bound byte plane needs a
     # positive pitch; an unbound plane is stored as absent.
     if alpha:
@@ -788,6 +842,8 @@ def sc_view_bind_surfaces(
     var px = pixels.value()
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pixels = px
     s[0].views[Int(slot) & (CAP_VIEWS - 1)].pitch = pixel_pitch
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_w = buf_w
+    s[0].views[Int(slot) & (CAP_VIEWS - 1)].buf_h = buf_h
     if alpha:
         s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha = alpha.value()
         s[0].views[Int(slot) & (CAP_VIEWS - 1)].alpha_pitch = alpha_pitch
@@ -937,25 +993,45 @@ def sc_compose(
                 var slot = s[0].stack[k & (CAP_VIEWS - 1)]
                 var v = s[0].views[Int(slot) & (CAP_VIEWS - 1)].copy()
                 if v.active != 0:
-                    if v.pixels:
+                    if v.pixels and v.buf_w > 0 and v.buf_h > 0:
                         var vp = v.pixels.value()
                         var vr = rect_intersect(Rect(v.x, v.y, v.w, v.h), r)
                         if not rect_is_empty(vr):
                             var vstride = v.pitch / Int32(4)
                             var sx = vr.x - v.x + v.off_x
                             var sy = vr.y - v.y + v.off_y
-                            blit_opaque(
-                                dst,
-                                stride,
-                                vp,
-                                vstride,
-                                vr.x,
-                                vr.y,
-                                sx,
-                                sy,
-                                vr.w,
-                                vr.h,
-                            )
+                            if v.alpha:
+                                blit_alpha(
+                                    dst,
+                                    stride,
+                                    vp,
+                                    vstride,
+                                    v.buf_w,
+                                    v.buf_h,
+                                    v.alpha.value(),
+                                    v.alpha_pitch,
+                                    vr.x,
+                                    vr.y,
+                                    sx,
+                                    sy,
+                                    vr.w,
+                                    vr.h,
+                                )
+                            else:
+                                blit_opaque(
+                                    dst,
+                                    stride,
+                                    vp,
+                                    vstride,
+                                    v.buf_w,
+                                    v.buf_h,
+                                    vr.x,
+                                    vr.y,
+                                    sx,
+                                    sy,
+                                    vr.w,
+                                    vr.h,
+                                )
                 k += 1
         d += 1
     return 0

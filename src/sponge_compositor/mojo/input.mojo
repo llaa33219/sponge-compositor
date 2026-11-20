@@ -189,9 +189,14 @@ def queue_flush(
 # a view without an alpha plane is opaque and consumes every point
 # inside its rect; an alpha-enabled view consults its input-mask plane
 # at the buffer coordinate (screen - view origin + buffer offset, the
-# same mapping sc_compose uses) - mask byte 0 falls through to the views
-# below, any other byte consumes. An alpha-enabled view without a mask
-# plane consumes (there is no hole to consult).
+# same mapping sc_compose uses) wrapped by the view's bind-time
+# (buf_w, buf_h) extent - the same tiling wrap as composition, so hit
+# testing never reads outside the bound mask plane while a geometry
+# change awaits its new buffer - where mask byte 0 falls through to the
+# views below and any other byte consumes. An alpha-enabled view without
+# a mask plane consumes (there is no hole to consult). A mask with a
+# zero extent is not sampled (nothing bound to sample) and consumes like
+# a mask-free alpha view.
 # ----------------------------------------------------------------------
 
 
@@ -215,12 +220,22 @@ def hit_test(
             continue
         if v.alpha:
             if v.mask:
+                # Zero extent: nothing bound to sample - do not read.
+                if v.buf_w <= 0 or v.buf_h <= 0:
+                    return slot
                 var lx = Int64(px) - Int64(v.x) + Int64(v.off_x)
                 var ly = Int64(py) - Int64(v.y) + Int64(v.off_y)
-                # The buffer-extent contract (../abi.h) guarantees the
-                # sample lies inside the bound mask plane.
+                # Tiling wrap (identical to composition's blits): the
+                # sample lands inside the bound mask extent even when
+                # the view geometry outgrew the current buffer.
+                var mx = ((lx % Int64(v.buf_w)) + Int64(v.buf_w)) % Int64(
+                    v.buf_w
+                )
+                var my = ((ly % Int64(v.buf_h)) + Int64(v.buf_h)) % Int64(
+                    v.buf_h
+                )
                 var m = v.mask.value()
-                var sample = (m + Int(ly) * Int(v.mask_pitch) + Int(lx)).load()
+                var sample = (m + Int(my) * Int(v.mask_pitch) + Int(mx)).load()
                 if sample == 0:
                     continue
             return slot
@@ -252,6 +267,42 @@ def emit_to_slot(
     )
 
 
+def emit_to_pressed(
+    s: UnsafePointer[Scene_state, MutUntrackedOrigin],
+    ev_type: Int32,
+    x: Int32,
+    y: Int32,
+    key: Int32,
+    codepoint: Int32,
+):
+    # Session-scoped receiver fallback (upstream nitpicker keeps a
+    # session-scoped View_owner receiver). The pressed slot is the
+    # primary target; when a decorator view destroy+recreate has
+    # cleared it, the delivery falls back to the session captured at
+    # press time (pressed_session). Exactly one target per call: the
+    # slot when it is valid and active, else the session fallback when
+    # it is in range and its session is active, never both. The slot
+    # clearing and the session preservation are scene.mojo's
+    # clear_slot_refs; sc_session_close clears the fallback.
+    var slot = s[0].pressed
+    if slot >= 0 and slot < Int32(CAP_VIEWS):
+        if s[0].views[Int(slot) & (CAP_VIEWS - 1)].active != 0:
+            queue_tuple(
+                s,
+                s[0].views[Int(slot) & (CAP_VIEWS - 1)].session,
+                ev_type,
+                x,
+                y,
+                key,
+                codepoint,
+            )
+            return
+    var ps = s[0].pressed_session
+    if ps >= 0 and ps < Int32(CAP_SESSIONS):
+        if s[0].sessions[Int(ps) & (CAP_SESSIONS - 1)].active != 0:
+            queue_tuple(s, ps, ev_type, x, y, key, codepoint)
+
+
 def clamp_ptr(
     s: UnsafePointer[Scene_state, MutUntrackedOrigin], x: Int64, y: Int64
 ):
@@ -281,7 +332,7 @@ def motion_step(s: UnsafePointer[Scene_state, MutUntrackedOrigin]):
         if s[0].hovered >= 0 and s[0].hovered != s[0].pressed:
             emit_to_slot(s, s[0].hovered, EV_HOVER_LEAVE, 0, 0, 0, 0)
             s[0].hovered = -1
-        emit_to_slot(s, s[0].pressed, EV_ABS_MOTION, s[0].ptr_x, s[0].ptr_y, 0, 0)
+        emit_to_pressed(s, EV_ABS_MOTION, s[0].ptr_x, s[0].ptr_y, 0, 0)
         return
     # Hover update plus forwarded event (upstream update_hover + the
     # forward in _handle_input_event). On a hover change the new view
@@ -320,6 +371,14 @@ def press_step(s: UnsafePointer[Scene_state, MutUntrackedOrigin], key: Int32, co
             emit_to_slot(s, switch_target, EV_FOCUS_ENTER, 0, 0, 0, 0)
             s[0].focused = switch_target
         s[0].pressed = s[0].focused
+        # Session-scoped receiver fallback, captured atomically with
+        # the receiver reset: the session of the active pressed view,
+        # or -1 when there is no active pressed view.
+        var ps = Int32(-1)
+        if s[0].pressed >= 0 and s[0].pressed < Int32(CAP_VIEWS):
+            if s[0].views[Int(s[0].pressed) & (CAP_VIEWS - 1)].active != 0:
+                ps = s[0].views[Int(s[0].pressed) & (CAP_VIEWS - 1)].session
+        s[0].pressed_session = ps
     # On a mouse-button press without prior drag motion the receiver
     # gets the current pointer position when it is not the hovered view
     # (e.g. a click outside every view goes to the focused view).
@@ -328,7 +387,7 @@ def press_step(s: UnsafePointer[Scene_state, MutUntrackedOrigin], key: Int32, co
             emit_to_slot(
                 s, s[0].pressed, EV_ABS_MOTION, s[0].ptr_x, s[0].ptr_y, 0, 0
             )
-    emit_to_slot(s, s[0].pressed, EV_PRESS, 0, 0, key, codepoint)
+    emit_to_pressed(s, EV_PRESS, 0, 0, key, codepoint)
 
 
 def release_step(s: UnsafePointer[Scene_state, MutUntrackedOrigin], key: Int32):
@@ -339,7 +398,7 @@ def release_step(s: UnsafePointer[Scene_state, MutUntrackedOrigin], key: Int32):
     s[0].key_cnt -= 1
     if is_mouse_button(key):
         s[0].buttons &= ~(Int32(1) << (key - Int32(BTN_LEFT)))
-    emit_to_slot(s, s[0].pressed, EV_RELEASE, 0, 0, key, 0)
+    emit_to_pressed(s, EV_RELEASE, 0, 0, key, 0)
     if s[0].key_cnt == 0:
         # Sequence end (upstream): the hover update runs now that no key
         # is held, then a drag receiver that is no longer hovered gets
@@ -430,7 +489,7 @@ def sc_input_step(
     elif ev_type == Int32(EV_WHEEL):
         # Wheel goes to the current input receiver (upstream routes it
         # to _input_receiver, not to the hovered view).
-        emit_to_slot(s, s[0].pressed, EV_WHEEL, a, b, 0, 0)
+        emit_to_pressed(s, EV_WHEEL, a, b, 0, 0)
     elif ev_type == Int32(EV_SEQ_NUMBER):
         # Sequence numbers go to the hovered view, else the focused one
         # (upstream seq_number routing); the value travels in `x`.
@@ -473,6 +532,20 @@ def sc_focus_forward(
     emit_to_slot(s, s[0].focused, EV_FOCUS_LEAVE, 0, 0, 0, 0)
     s[0].focused = slot
     emit_to_slot(s, s[0].focused, EV_FOCUS_ENTER, 0, 0, 0, 0)
+    return 0
+
+
+@export("sc_focus_clear")
+def sc_focus_clear(state: UnsafePointer[UInt8, MutUntrackedOrigin]) abi("C") -> Int32:
+    if is_null_state(state):
+        return -1
+    var s = state_of(state)
+    if s[0].focused < 0:
+        return 0
+    if s[0].evq_n + 1 > Int32(CAP_TUPLES):
+        return -2
+    emit_to_slot(s, s[0].focused, EV_FOCUS_LEAVE, 0, 0, 0, 0)
+    s[0].focused = -1
     return 0
 
 
