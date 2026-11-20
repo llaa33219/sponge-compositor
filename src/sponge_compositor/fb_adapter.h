@@ -46,6 +46,9 @@ struct Fb_session : Genode::Session_object<Framebuffer::Session>
 
 		Framebuffer::Mode _mode { };
 
+		Genode::Signal_context_capability _mode_sigh { };
+		Genode::Signal_context_capability _sync_sigh { };
+
 		/*
 		 * Real pixel dataspace of the client buffer. The pixel layer
 		 * is 4 bytes per pixel ('Pixel_rgb888'); a client may request
@@ -123,6 +126,8 @@ struct Fb_session : Genode::Session_object<Framebuffer::Session>
 		 * 'alpha' buffer
 		 */
 		Genode::int32_t byte_pitch() const;
+
+		void submit_sync();
 
 
 		/*******************************

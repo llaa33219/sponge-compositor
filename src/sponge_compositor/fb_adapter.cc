@@ -37,6 +37,10 @@ bool Fb_session::define_buffer(Framebuffer::Mode mode)
 	}
 
 	_mode = mode;
+
+	if (_mode_sigh.valid())
+		Genode::Signal_transmitter(_mode_sigh).submit();
+
 	return true;
 }
 
@@ -115,9 +119,9 @@ Framebuffer::Mode Fb_session::mode() const
 }
 
 
-void Fb_session::mode_sigh(Genode::Signal_context_capability /* sigh */)
+void Fb_session::mode_sigh(Genode::Signal_context_capability sigh)
 {
-	Genode::warning("not implemented before G2: mode_sigh");
+	_mode_sigh = sigh;
 }
 
 
@@ -155,13 +159,20 @@ void Fb_session::panning(Framebuffer::Point /* pos */)
 }
 
 
-void Fb_session::sync_sigh(Genode::Signal_context_capability /* sigh */)
+void Fb_session::sync_sigh(Genode::Signal_context_capability sigh)
 {
-	Genode::warning("not implemented before G2: sync_sigh");
+	_sync_sigh = sigh;
+}
+
+
+void Fb_session::submit_sync()
+{
+	if (_sync_sigh.valid())
+		Genode::Signal_transmitter(_sync_sigh).submit();
 }
 
 
 void Fb_session::sync_source(Genode::Session_label const & /* label */)
 {
-	Genode::warning("not implemented before G2: sync_source");
+	/* All Gui sessions of this compositor share the same frame source. */
 }

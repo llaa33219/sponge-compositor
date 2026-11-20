@@ -52,8 +52,9 @@ extern "C" {
  *    0  OK
  *   -1  bad arguments (NULL state block, NULL buffer where a buffer is
  *       required, undersized state block, negative width/height,
- *       out-of-range color component, bad kind, duplicate view id,
- *       non-positive or non-4-byte pitch, ...)
+ *       non-positive buffer width/height, out-of-range color component,
+ *       bad kind, duplicate view id, non-positive or non-4-byte pitch,
+ *       ...)
  *   -2  capacity exhausted (all 8 sessions in use, all 32 views in use,
  *       or the caller's rect buffer cannot hold the pending damage)
  *   -3  unknown handle or id (stale session handle, stale view id,
@@ -101,8 +102,8 @@ enum {
  * the Mojo side; InlineArray storage, no heap):
  */
 enum {
-	SC_MAX_SESSIONS = 8,
-	SC_MAX_VIEWS    = 32,
+	SC_MAX_SESSIONS = 32,
+	SC_MAX_VIEWS    = 64,
 	SC_MAX_DAMAGE   = 3
 };
 
@@ -120,13 +121,21 @@ enum {
  * positive multiple of 4 (the pixel word size). Row stride in words is
  * `pitch / 4`.
  *
- * View buffer extent contract for sc_view_bind_pixels: the buffer
- * behind `pixels` must provide, for the view's current geometry and
- * buffer offset, at least `pitch` bytes per row over the rows
- * `off_y .. off_y + h - 1` and at least `off_x + w` pixels per such
- * row. The compositor never reads outside that extent. Rebind
- * (sc_view_bind_pixels) may be called on every buffer hand-off, e.g.
- * when alternating between two buffers.
+ * View buffer extent contract for sc_view_bind_pixels and
+ * sc_view_bind_surfaces: the caller reports the buffer's own pixel
+ * dimensions (`buf_w` x `buf_h`, positive) at bind time - the extent of
+ * the pixel (and alpha/input-mask) buffer itself, NOT the view's
+ * current geometry. The buffer must provide `pitch` bytes per row over
+ * `buf_h` rows and at least `buf_w` pixels per such row. The compositor
+ * never reads outside that extent: composition and input-mask sampling
+ * tile the bound extent across the view like upstream nitpicker
+ * (`os/src/server/nitpicker/view.cc` tiling a frozen-size texture), so
+ * a view that grows before its next buffer arrives (e.g. maximize)
+ * wraps its source coordinates back into the previous extent instead of
+ * reading past it. Inside the extent every pixel is read exactly as
+ * before. Rebind (sc_view_bind_pixels / sc_view_bind_surfaces) may be
+ * called on every buffer hand-off, e.g. when alternating between two
+ * buffers.
  *
  * View ids. `view_id` and `neighbor` are 64-bit (Genode::uint64_t),
  * matching the public Gui `View_id` (`Id_space<View_ref>::Id`,
@@ -141,8 +150,9 @@ enum {
  * (nominally one) consumes the input at that pixel. Byte-plane pitches
  * are row pitches in BYTES (no alignment requirement beyond being
  * positive); the buffer-extent contract above applies per plane: each
- * bound plane must provide `pitch` bytes per row over the rows
- * `off_y .. off_y + h - 1` and at least `off_x + w` bytes per such row.
+ * bound plane must provide `pitch` bytes per row over the `buf_h` rows
+ * and at least `buf_w` bytes per such row, and is sampled with the same
+ * tiling wrap as the pixel plane.
  */
 
 /* ------------------------------------------------------------------ */
@@ -227,8 +237,12 @@ Genode::int32_t sc_view_destroy(Genode::uint8_t *state,
  * buffer hand-off; the binding is replaced wholesale, including any
  * alpha/input-mask planes bound with sc_view_bind_surfaces (the view
  * hit-tests as opaque again). `pixels` points at the pixel word for
- * buffer coordinate (0, 0); see the buffer extent contract above. NULL
- * `pixels` or a bad pitch is -1.
+ * buffer coordinate (0, 0); `buf_w` and `buf_h` are the buffer's pixel
+ * dimensions (see the buffer extent contract above) - they describe the
+ * bound buffer, not the view's current geometry, and are what
+ * composition wraps source coordinates over while a geometry change
+ * awaits its new buffer. NULL `pixels`, a bad pitch, or non-positive
+ * `buf_w`/`buf_h` is -1.
  *
  * Returns 0, -1 for bad arguments (including a NULL state block), or
  * -3 for unknown session/view.
@@ -237,30 +251,38 @@ Genode::int32_t sc_view_bind_pixels(Genode::uint8_t *state,
                                     Genode::int32_t session,
                                     Genode::uint64_t view_id,
                                     Genode::uint32_t const *pixels,
-                                    Genode::int32_t pitch);
+                                    Genode::int32_t pitch,
+                                    Genode::int32_t buf_w,
+                                    Genode::int32_t buf_h);
 
 /*
  * Bind (or re-bind) the full surface set of a view: the pixel plane
  * (required, as for sc_view_bind_pixels) plus optional alpha and
  * input-mask planes (each NULL or a valid plane with a positive byte
  * pitch; NULL clears that plane). The binding is replaced wholesale on
- * every call. The planes drive hit testing (see "Hit testing and input
- * delivery" below): a view with no alpha plane is opaque and consumes
- * every input point inside its rect; an alpha-enabled view consults its
- * input-mask plane where zero falls through to the views below and
- * nonzero consumes; an alpha-enabled view without a mask plane consumes
- * inside its rect. A mask plane bound without an alpha plane has no
- * effect.
+ * every call. `buf_w`/`buf_h` are the buffer's pixel dimensions, shared
+ * by all three planes (the plane layout of one Framebuffer::Mode - see
+ * the buffer extent contract above); like sc_view_bind_pixels they
+ * describe the bound buffer, not the view's current geometry. The
+ * planes drive hit testing (see "Hit testing and input delivery" below):
+ * a view with no alpha plane is opaque and consumes every input point
+ * inside its rect; an alpha-enabled view consults its input-mask plane
+ * where zero falls through to the views below and nonzero consumes; an
+ * alpha-enabled view without a mask plane consumes inside its rect. A
+ * mask plane bound without an alpha plane has no effect.
  *
  * Returns 0; -1 for a NULL state block, NULL pixels, a non-positive or
- * non-4-byte pixel pitch, or a non-positive pitch of a bound byte
- * plane; -3 for an unknown session or stale view id.
+ * non-4-byte pixel pitch, non-positive `buf_w`/`buf_h`, or a
+ * non-positive pitch of a bound byte plane; -3 for an unknown session
+ * or stale view id.
  */
 Genode::int32_t sc_view_bind_surfaces(Genode::uint8_t *state,
                                       Genode::int32_t session,
                                       Genode::uint64_t view_id,
                                       Genode::uint32_t const *pixels,
                                       Genode::int32_t pixel_pitch,
+                                      Genode::int32_t buf_w,
+                                      Genode::int32_t buf_h,
                                       Genode::uint8_t const *alpha,
                                       Genode::int32_t alpha_pitch,
                                       Genode::uint8_t const *input_mask,
@@ -370,9 +392,13 @@ enum { SC_EVENT_TUPLE_INTS = 8 };
  * stops at the first consuming view: a point outside every view rect
  * delivers to no view; a view without an alpha plane consumes every
  * point inside its rect; an alpha-enabled view consults its input-mask
- * plane at buffer coordinate (px - x + off_x, py - y + off_y) - mask
- * byte 0 falls through to the views below, nonzero consumes; an
- * alpha-enabled view without a mask plane consumes inside its rect.
+ * plane at buffer coordinate (floor-mod of (px - x + off_x) by buf_w,
+ * floor-mod of (py - y + off_y) by buf_h - the same tiling wrap as
+ * composition, so hit testing never reads outside the bound extent) -
+ * mask byte 0 falls through to the views below, nonzero consumes; an
+ * alpha-enabled view without a mask plane consumes inside its rect. A
+ * zero-extent mask (buf_w or buf_h is 0) is not sampled and consumes
+ * like a mask-free alpha view.
  */
 
 /*
@@ -464,6 +490,9 @@ Genode::int32_t sc_focus_forward(Genode::uint8_t *state,
                                  Genode::int32_t session,
                                  Genode::uint64_t target);
 
+/* Clear the focused view and deliver SC_EV_FOCUS_LEAVE to its previous owner. */
+Genode::int32_t sc_focus_clear(Genode::uint8_t *state);
+
 /*
  * Report the current pointer position. The position is clamped to the
  * screen and starts at (0, 0) after sc_scene_init; relative motion
@@ -523,11 +552,14 @@ Genode::int32_t sc_damage_count(Genode::uint8_t *state);
  * (`pitch` in bytes, see the pixel conventions). Only the pending
  * damage rects are repainted (clipped to view geometry and screen):
  * each damage rect is filled with the background color first, then
- * views are painted bottom-up (stack order) as opaque copies of their
- * bound buffers, so later (higher) views overwrite earlier ones where
- * they overlap. Views without a bound buffer are skipped (the
- * background shows through). With no pending damage nothing is
- * painted - add damage first (typically the full screen at startup).
+ * views are painted bottom-up (stack order) as tiled copies of their
+ * bound buffers (source coordinates floor-mod the bind-time buf_w/buf_h
+ * extent - the buffer extent contract above), so later (higher) views
+ * overwrite earlier ones where they overlap. Views without a bound
+ * buffer are skipped (the background shows through), as are views
+ * whose bound extent is zero (nothing to sample). With no pending
+ * damage nothing is painted - add damage first (typically the full
+ * screen at startup).
  * Damage is NOT cleared here; sc_damage_fetch clears it.
  *
  * Returns 0 (also when nothing is painted), or -1 for a NULL state

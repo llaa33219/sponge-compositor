@@ -36,6 +36,18 @@ static Genode::uint64_t view_id_value(Gui::View_id id)
 }
 
 
+/*
+ * 'label_prefix' selector match (upstream 'Node_label_score' semantics:
+ * the label starts with the selector; an empty selector matches).
+ */
+static bool label_starts_with(Genode::Session::Label const &label,
+                              Genode::String<160>  const &prefix)
+{
+	return Genode::strcmp(label.string(), prefix.string(),
+	                      Genode::strlen(prefix.string())) == 0;
+}
+
+
 /*******************************
  ** Gui_session_component    **
  *******************************/
@@ -47,12 +59,11 @@ Gui_session_component::Gui_session_component(
 	Genode::int32_t             scene_handle,
 	Genode::Session::Resources  const &resources,
 	Genode::Session::Label      const &label,
-	Genode::int32_t             screen_w,
-	Genode::int32_t             screen_h)
+	Domain_rect           const &domain_rect)
 :
 	Genode::Session_object<Gui::Session>(env.ep(), resources, label),
 	_env(env), _state(state), _pipeline(pipeline), _handle(scene_handle),
-	_screen_w(screen_w), _screen_h(screen_h),
+	_domain_rect(domain_rect),
 	_fb(env, state, resources, label),
 	_input(env, state)
 {
@@ -118,13 +129,19 @@ void Gui_session_component::_bind_view(Genode::uint64_t id)
 
 	/*
 	 * Bind the full surface set (abi.h): the pixel plane plus the
-	 * alpha and input-mask planes of an 'alpha' buffer. Non-alpha
-	 * buffers pass absent planes and keep the view hit-testing
-	 * opaque; an 'alpha' buffer consults its input-mask plane, where
-	 * a zero mask byte falls through to the views below.
+	 * alpha and input-mask planes of an 'alpha' buffer, together
+	 * with the buffer's own pixel dimensions (_fb.mode().area.w/h).
+	 * The extent describes the bound buffer, not the view's current
+	 * geometry, so composition and hit testing can tile it safely
+	 * while a geometry change (e.g. maximize) awaits its new buffer.
+	 * Non-alpha buffers pass absent planes and keep the view
+	 * hit-testing opaque; an 'alpha' buffer consults its input-mask
+	 * plane, where a zero mask byte falls through to the views below.
 	 */
 	Genode::int32_t const r = sc_view_bind_surfaces(
 		_state, _handle, id, pixels, _fb.pitch(),
+		(Genode::int32_t)_fb.mode().area.w,
+		(Genode::int32_t)_fb.mode().area.h,
 		_fb.alpha(), _fb.byte_pitch(),
 		_fb.input_mask(), _fb.byte_pitch());
 
@@ -327,6 +344,8 @@ void Gui_session_component::execute()
 
 	for (unsigned i = 0; i < n; i++)
 		_execute_command(_command_buffer.get(i));
+
+	_command_buffer.reset();
 }
 
 
@@ -365,7 +384,7 @@ void Gui_session_component::_forward_scene_focus()
 void Gui_session_component::focus(Gui::Session_capability focused)
 {
 	if (!focused.valid()) {
-		Genode::warning("not implemented: focus reset (no G2 focus policy)");
+		_pipeline.focus_clear();
 		return;
 	}
 
@@ -389,6 +408,12 @@ void Gui_session_component::focus(Gui::Session_capability focused)
 }
 
 
+void Gui_session_component::submit_sync()
+{
+	_fb.submit_sync();
+}
+
+
 /*******************************
  ** Info_rom                  **
  *******************************/
@@ -406,23 +431,26 @@ void Gui_session_component::Info_rom::produce_xml(Genode::Xml_generator &xml)
 {
 	/*
 	 * Root 'panorama' node: xpos/ypos/width/height attributes of the
-	 * screen (public 'Rect::from_node' parsing surface of
-	 * util/geometry.h as consumed by 'Gui::Connection::panorama').
+	 * session's domain rect (public 'Rect::from_node' parsing surface
+	 * of util/geometry.h as consumed by 'Gui::Connection::panorama').
 	 */
-	xml.attribute("xpos",   0);
-	xml.attribute("ypos",   0);
-	xml.attribute("width",  _session._screen_w);
-	xml.attribute("height", _session._screen_h);
+	Domain_rect const &rect = _session._domain_rect;
+
+	xml.attribute("xpos",   rect.x);
+	xml.attribute("ypos",   rect.y);
+	xml.attribute("width",  rect.w);
+	xml.attribute("height", rect.h);
 
 	/*
 	 * Capture sub-node: the captured screen area ('Gui::Connection::
-	 * window' compounds the capture sub-nodes).
+	 * window' compounds the capture sub-nodes), clipped to the
+	 * session's domain rect like upstream 'gen_capture_attr'.
 	 */
 	xml.node("capture", [&] {
-		xml.attribute("xpos",   0);
-		xml.attribute("ypos",   0);
-		xml.attribute("width",  _session._screen_w);
-		xml.attribute("height", _session._screen_h);
+		xml.attribute("xpos",   rect.x);
+		xml.attribute("ypos",   rect.y);
+		xml.attribute("width",  rect.w);
+		xml.attribute("height", rect.h);
 	});
 }
 
@@ -440,7 +468,236 @@ Gui_root::Gui_root(Genode::Env &env, Genode::Heap &heap,
 	_env(env), _state(state), _pipeline(pipeline),
 	_screen_w(config.attribute_value("width",  1024)),
 	_screen_h(config.attribute_value("height", 768))
-{ }
+{
+	_parse_domains(config);
+	_parse_policies(config);
+}
+
+
+Gui_root::Domain const *
+Gui_root::_lookup_domain(Domain::Name const &name) const
+{
+	for (unsigned i = 0; i < _num_domains; i++)
+		if (_domains[i].used && _domains[i].name == name)
+			return &_domains[i];
+	return nullptr;
+}
+
+
+Gui_root::Domain::Origin
+Gui_root::_parse_origin(Genode::Node const &domain)
+{
+	using Value = Genode::String<32>;
+	Value const value = domain.attribute_value("origin", Value("top_left"));
+
+	if (value == "top_left")     return Domain::Origin::TOP_LEFT;
+	if (value == "top_right")    return Domain::Origin::TOP_RIGHT;
+	if (value == "bottom_left")  return Domain::Origin::BOTTOM_LEFT;
+	if (value == "bottom_right") return Domain::Origin::BOTTOM_RIGHT;
+	if (value == "pointer")      return Domain::Origin::POINTER;
+
+	Genode::warning("invalid value of origin attribute in <domain>");
+	return Domain::Origin::BOTTOM_LEFT;
+}
+
+
+void Gui_root::_parse_domains(Genode::Node const &config)
+{
+	config.for_each_sub_node("domain", [&] (Genode::Node const &node) {
+
+		Domain::Name const name = node.attribute_value("name", Domain::Name());
+
+		if (!name.valid()) {
+			Genode::error("no valid domain name specified");
+			return;
+		}
+
+		if (_lookup_domain(name)) {
+			Genode::error("domain name \"", name, "\" is not unique");
+			return;
+		}
+
+		if (_num_domains >= MAX_DOMAINS) {
+			Genode::warning("domain table full (", (unsigned)MAX_DOMAINS,
+			                " entries), ignoring domain \"", name, "\"");
+			return;
+		}
+
+		Domain &domain = _domains[_num_domains++];
+
+		domain.used   = true;
+		domain.name   = name;
+		domain.origin = _parse_origin(node);
+		domain.xpos   = node.attribute_value("xpos",   (Genode::int32_t)0);
+		domain.ypos   = node.attribute_value("ypos",   (Genode::int32_t)0);
+		domain.width  = node.attribute_value("width",  (Genode::int32_t)0);
+		domain.height = node.attribute_value("height", (Genode::int32_t)0);
+	});
+}
+
+
+void Gui_root::_parse_policies(Genode::Node const &config)
+{
+	config.for_each_sub_node("policy", [&] (Genode::Node const &node) {
+
+		Policy policy { };
+
+		policy.has_label = node.has_attribute("label");
+		if (policy.has_label)
+			policy.label = node.attribute_value("label", Policy::Selector());
+
+		policy.has_label_prefix = node.has_attribute("label_prefix");
+		if (policy.has_label_prefix)
+			policy.label_prefix =
+				node.attribute_value("label_prefix", Policy::Selector());
+
+		policy.has_label_last = node.has_attribute("label_last");
+		if (policy.has_label_last)
+			policy.label_last =
+				node.attribute_value("label_last", Policy::Selector());
+
+		if (!policy.has_label && !policy.has_label_prefix &&
+		    !policy.has_label_last) {
+			Genode::error("policy without label, label_prefix, or "
+			              "label_last attribute ignored");
+			return;
+		}
+
+		if (!node.has_attribute("domain")) {
+			Genode::error("policy for label \"",
+			              policy.has_label        ? policy.label :
+			              policy.has_label_prefix ? policy.label_prefix :
+			                                        policy.label_last,
+			              "\" lacks domain declaration");
+			return;
+		}
+
+		policy.domain = node.attribute_value("domain", Domain::Name());
+
+		if (!_lookup_domain(policy.domain)) {
+			Genode::error("policy for label \"",
+			              policy.has_label        ? policy.label :
+			              policy.has_label_prefix ? policy.label_prefix :
+			                                        policy.label_last,
+			              "\" specifies nonexistent domain \"",
+			              policy.domain, "\"");
+			return;
+		}
+
+		if (_num_policies >= MAX_POLICIES) {
+			Genode::warning("policy table full (", (unsigned)MAX_POLICIES,
+			                " entries), ignoring policy for domain \"",
+			                policy.domain, "\"");
+			return;
+		}
+
+		policy.used = true;
+		_policies[_num_policies++] = policy;
+	});
+
+	config.with_sub_node("default-policy",
+		[&] (Genode::Node const &node) {
+
+			if (!node.has_attribute("domain")) {
+				Genode::error("default-policy lacks domain declaration");
+				return;
+			}
+
+			Domain::Name const name =
+				node.attribute_value("domain", Domain::Name());
+
+			if (!_lookup_domain(name)) {
+				Genode::error("default-policy specifies nonexistent "
+				              "domain \"", name, "\"");
+				return;
+			}
+
+			_default_policy_domain = name;
+			_has_default_policy    = true;
+		},
+		[&] { });
+}
+
+
+Domain_rect Gui_root::_domain_rect_for(Genode::Session::Label const &label) const
+{
+	/*
+	 * Policy match order: exact 'label', then 'label_prefix'
+	 * (longest selector wins), then 'label_last', then
+	 * '<default-policy>', else the full screen. A policy with
+	 * several selectors requires all of them to match and ranks by
+	 * its strongest selector.
+	 */
+	enum { TIER_NONE = 0, TIER_LAST = 1, TIER_PREFIX = 2, TIER_EXACT = 3 };
+
+	Policy const *best = nullptr;
+	unsigned      best_tier  = TIER_NONE;
+	Genode::size_t best_score = 0;
+
+	for (unsigned i = 0; i < _num_policies; i++) {
+
+		Policy const &policy = _policies[i];
+		if (!policy.used)
+			continue;
+
+		if (policy.has_label && !(label == policy.label))
+			continue;
+		if (policy.has_label_prefix &&
+		    !label_starts_with(label, policy.label_prefix))
+			continue;
+		if (policy.has_label_last &&
+		    !(label.last_element() == policy.label_last))
+			continue;
+
+		unsigned const tier =
+			policy.has_label        ? TIER_EXACT :
+			policy.has_label_prefix ? TIER_PREFIX : TIER_LAST;
+
+		Genode::size_t const score =
+			policy.has_label_prefix
+				? Genode::strlen(policy.label_prefix.string()) : 0;
+
+		if (tier > best_tier || (tier == best_tier && score > best_score)) {
+			best       = &policy;
+			best_tier  = tier;
+			best_score = score;
+		}
+	}
+
+	Domain const *domain = nullptr;
+
+	if (best) {
+		domain = _lookup_domain(best->domain);
+		if (!domain)
+			Genode::warning("policy specifies nonexistent domain \"",
+			                best->domain, "\"");
+	} else if (_has_default_policy) {
+		domain = _lookup_domain(_default_policy_domain);
+		if (!domain)
+			Genode::warning("default-policy specifies nonexistent "
+			                "domain \"", _default_policy_domain, "\"");
+	}
+
+	if (!domain)
+		return { 0, 0, _screen_w, _screen_h };
+
+	/*
+	 * 'Domain_registry::Entry::screen_rect' semantics: positive
+	 * width/height give the value, nonpositive values count back
+	 * from the screen edge (max(0, screen + delta)). The panorama
+	 * origin is (0, 0), so xpos/ypos shift the rect directly.
+	 */
+	auto aligned = [&] (Genode::int32_t limit, Genode::int32_t v) {
+		if (v > 0)
+			return v;
+		Genode::int32_t const sum = limit + v;
+		return (sum > 0) ? sum : (Genode::int32_t)0;
+	};
+
+	return { domain->xpos, domain->ypos,
+	         aligned(_screen_w, domain->width),
+	         aligned(_screen_h, domain->height) };
+}
 
 
 Gui_root::Create_result
@@ -468,10 +725,17 @@ Gui_root::_create_session(char const *args, Genode::Affinity const &)
 	 * the session object; if the object cannot be allocated the handle
 	 * is closed again right here.
 	 */
-	return _alloc_obj(_env, _state, _pipeline, handle, resources, label,
-	                  _screen_w, _screen_h)
+	Domain_rect const rect = _domain_rect_for(label);
+
+	return _alloc_obj(_env, _state, _pipeline, handle, resources, label, rect)
 		.template convert<Create_result>(
 			[&] (Gui_session_component &session) -> Gui_session_component & {
+				for (unsigned i = 0; i < SC_MAX_SESSIONS; i++) {
+					if (!_sessions[i]) {
+						_sessions[i] = &session;
+						break;
+					}
+				}
 				return session; },
 			[&] (Genode::Session_error error) -> Genode::Session_error {
 				sc_session_close(_state, handle);
@@ -489,7 +753,19 @@ void Gui_root::_upgrade_session(Gui_session_component &session, char const *args
 
 void Gui_root::_destroy_session(Gui_session_component &session)
 {
+	for (unsigned i = 0; i < SC_MAX_SESSIONS; i++)
+		if (_sessions[i] == &session)
+			_sessions[i] = nullptr;
+
 	Genode::destroy(md_alloc(), &session);
+}
+
+
+void Gui_root::submit_sync()
+{
+	for (unsigned i = 0; i < SC_MAX_SESSIONS; i++)
+		if (_sessions[i])
+			_sessions[i]->submit_sync();
 }
 
 
